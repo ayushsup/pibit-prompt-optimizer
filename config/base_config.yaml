@@ -1,0 +1,19 @@
+dataset:
+  name: "hiring/resume"
+  base_path: "./data/extract-bench"
+  split_seed: 42
+  train_ratio: 0.6
+  val_ratio: 0.2
+
+budget:
+  max_iterations: 20
+  max_cost_dollars: 0.0  # Cost is $0 on Gemini Free Tier
+
+models:
+  extractor: "gemini-1.5-flash"
+  critic: "gemini-1.5-flash"
+  mutator: "gemini-1.5-pro"  # Slower, but higher reasoning for writing prompts
+
+seed_prompt: |
+  Extract the structured information from the provided document.
+  Return ONLY valid JSON matching the exact schema. Do not include markdown formatting like ```json.

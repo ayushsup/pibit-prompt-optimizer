@@ -1,0 +1,19 @@
+dataset:
+  name: "hiring/resume"
+  base_path: "./data/extract-bench"
+  split_seed: 42
+  train_ratio: 0.05  # Tiny fraction of data for lightning-fast testing
+  val_ratio: 0.05    # Tiny fraction for quick validation scoring
+
+budget:
+  max_iterations: 3  # Stop early to test the end-to-end loop completion
+  max_cost_dollars: 0.0
+
+models:
+  extractor: "gemini-1.5-flash"
+  critic: "gemini-1.5-flash"
+  mutator: "gemini-1.5-flash"  # Use Flash for everything to maximize testing speed
+
+seed_prompt: |
+  Extract the structured information from the provided document.
+  Return ONLY valid JSON matching the exact schema. Do not include markdown formatting like ```json.
