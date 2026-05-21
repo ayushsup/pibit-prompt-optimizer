@@ -1,28 +1,34 @@
 import yaml
 from src.core.state_manager import StateManager
 from src.agents.critic_mutator import Extractor, Critic, Mutator
-# Assume you have implemented a Scorer and DataLoader in src/evaluation/ and src/data/
-# from src.evaluation.scorer import Scorer
-# from src.data.loader import ExtractBenchLoader
+from src.data.loader import ExtractBenchLoader
 
 class OptimizerLoop:
     def __init__(self, config_path: str):
         with open(config_path, 'r') as f:
             self.config = yaml.safe_load(f)
-            
+
         self.state = StateManager()
         self.extractor = Extractor(self.config['models']['extractor'], self.state)
         self.critic = Critic(self.config['models']['critic'], self.state)
         self.mutator = Mutator(self.config['models']['mutator'], self.state)
-        
-        # Placeholders for data/scoring implementation
-        # self.data = ExtractBenchLoader(self.config['dataset'])
+
+        # Setup data loader for real dataset
+        dataset_cfg = self.config['dataset']
+        self.data = ExtractBenchLoader(
+            base_path=dataset_cfg['base_path'] + "/dataset",
+            schema_name=dataset_cfg['name']
+        )
         # self.scorer = Scorer()
-        
+
         self.budget_dollars = self.config['budget']['max_cost_dollars']
         self.max_iters = self.config['budget']['max_iterations']
 
     def check_budget(self) -> bool:
+        # Treat 0.0 as an unlimited financial budget (for free tiers/local models)
+        if self.budget_dollars <= 0.0:
+            return True
+            
         current_cost = self.state.get_total_cost()
         if current_cost >= self.budget_dollars:
             print(f"Budget exhausted (${current_cost:.2f} / ${self.budget_dollars:.2f}). Terminating.")
@@ -34,9 +40,8 @@ class OptimizerLoop:
         current_prompt = self.config['seed_prompt']
         best_score = 0.0
         
-        # Load validation data
-        # val_docs = self.data.get_split('val')
-        val_docs = [] # Placeholder: List of dicts with 'text', 'gold_json', 'schema'
+        # Load validation data from real dataset
+        val_docs = self.data.load_all_document_pairs()
         
         for iteration in range(self.max_iters):
             if not self.check_budget():

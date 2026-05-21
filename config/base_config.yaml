@@ -6,8 +6,8 @@ dataset:
   val_ratio: 0.2
 
 budget:
-  max_iterations: 20
-  max_cost_dollars: 0.0  # Cost is $0 on Gemini Free Tier
+  max_iterations: 20  # Keep your iteration limit
+  max_cost_dollars: 100.0  # Set high so the 0.0 >= 0.0 condition doesn't trigger
 
 models:
   extractor: "gemini-1.5-flash"
