@@ -10,9 +10,9 @@ budget:
   max_cost_dollars: 0.0
 
 models:
-  extractor: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
-  critic: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
-  mutator: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
+  extractor: "poolside/laguna-xs.2:free"
+  critic: "poolside/laguna-xs.2:free"
+  mutator: "poolside/laguna-xs.2:free"
 
 seed_prompt: |
   Extract the structured information from the provided document.
