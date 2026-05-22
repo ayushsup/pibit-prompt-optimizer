@@ -46,7 +46,7 @@ class BaseAgent:
                 
             except Exception as e:
                 if "429" in str(e) and attempt < max_retries - 1:
-                    print(f"Rate limit hit for {role_name}. Sleeping for 15 seconds...")
-                    time.sleep(15)
+                    print(f"Rate limit hit for {role_name}. Sleeping for 60 seconds to reset quota...")
+                    time.sleep(60)
                 else:
                     raise e

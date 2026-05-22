@@ -10,10 +10,10 @@ budget:
   max_cost_dollars: 100.0  # Set high so the 0.0 >= 0.0 condition doesn't trigger
 
 models:
-  extractor: "gemini-1.5-flash"
-  critic: "gemini-1.5-flash"
-  mutator: "gemini-1.5-flash"  # Use Flash for everything to maximize testing speed
-
+  extractor: "gemini-2.5-flash"
+  critic: "gemini-2.5-flash"
+  mutator: "gemini-2.5-pro"
+  
 seed_prompt: |
   Extract the structured information from the provided document.
   Return ONLY valid JSON matching the exact schema. Do not include markdown formatting like ```json.

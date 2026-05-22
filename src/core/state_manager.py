@@ -55,7 +55,7 @@ class StateManager:
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "INSERT INTO optimization_trajectory (iteration, prompt, val_score, accepted) VALUES (?, ?, ?, ?)",
+                "INSERT OR REPLACE INTO optimization_trajectory (iteration, prompt, val_score, accepted) VALUES (?, ?, ?, ?)",
                 (iteration, prompt, val_score, accepted)
             )
             conn.commit()

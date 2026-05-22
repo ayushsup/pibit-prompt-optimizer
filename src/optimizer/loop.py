@@ -40,8 +40,8 @@ class OptimizerLoop:
         current_prompt = self.config['seed_prompt']
         best_score = 0.0
         
-        # Load validation data from real dataset
-        val_docs = self.data.load_all_document_pairs()
+        # Load ONLY the first 2 validation documents to prevent rate limits during testing
+        val_docs = self.data.load_all_document_pairs()[:2]
         
         for iteration in range(self.max_iters):
             if not self.check_budget():
@@ -55,8 +55,35 @@ class OptimizerLoop:
             # 1. Evaluate current prompt
             for doc in val_docs:
                 prediction = self.extractor.extract(doc['text'], current_prompt, doc['schema'])
-                # score = self.scorer.calculate_f1(prediction, doc['gold_json'])
-                score = 0.8 # Placeholder for actual scoring logic
+                
+                # --- NEW REAL SCORING LOGIC ---
+                try:
+                    import json
+                    # Clean the LLM output in case it wrapped it in markdown
+                    clean_pred = prediction.replace("```json", "").replace("```", "").strip()
+                    pred_data = json.loads(clean_pred)
+                    gold_data = json.loads(doc['gold_json'])
+                    
+                    # Calculate a simple accuracy score based on matching top-level keys
+                    correct_keys = 0
+                    total_keys = len(gold_data.keys())
+                    
+                    for key, gold_val in gold_data.items():
+                        if key in pred_data:
+                            # If values match exactly, or both are populated lists/strings
+                            if pred_data[key] == gold_val:
+                                correct_keys += 1
+                            elif isinstance(gold_val, list) and isinstance(pred_data[key], list) and len(pred_data[key]) > 0:
+                                correct_keys += 0.5 # Partial credit for extracting array items
+                            elif isinstance(gold_val, str) and isinstance(pred_data[key], str) and len(pred_data[key]) > 0:
+                                correct_keys += 0.5 # Partial credit for extracting a string
+
+                    score = correct_keys / max(total_keys, 1)
+                except Exception as e:
+                    print(f"JSON Parse Error: Extractor failed to output valid JSON.")
+                    score = 0.0  # Total failure if JSON is invalid
+                # ------------------------------
+                
                 total_score += score
                 
                 if score < 1.0:
