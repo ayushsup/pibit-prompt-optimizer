@@ -1,0 +1,68 @@
+--- Prompt_v1
++++ Prompt_v2
+@@ -1,2 +1,64 @@
+-Extract the structured information from the provided document.
+-Return ONLY valid JSON matching the exact schema. Do not include markdown formatting like ```json.+
++Extract the structured information from the provided document. Return ONLY valid JSON matching the exact schema. Do not include markdown formatting like ```json.  
++
++**Schema Requirements**:  
++1. **Personal Info**:  
++   - `name`: Exact full name as stated in the document.  
++   - `statement`: Direct quote or paraphrased summary of the person's professional statement (e.g., focus area, career goals).  
++   - `contact`: Object with `email` (exact value) and `phone` (exact value, including country code if present).  
++
++2. **Work Experience**:  
++   - Array of objects with `company`, `title`, `dates` (ISO 8601 format with timestamps, e.g., `2019-02-28T23:00:00.000Z`), `description`, and `isCurrent` (boolean). Include `media` and `other` fields if present in the document.  
++
++3. **Education**:  
++   - Array of objects with `institution`, `degree`, `dates`, and `description` (include merit/GPA details if mentioned).  
++
++4. **Skills**:  
++   - Array of strings listing skills explicitly mentioned (e.g., "Financial Expertise", "Technical Skills"). Do not infer or add related skills.  
++
++5. **Publications/Certifications**:  
++   - Arrays of strings. If the document does not mention these, leave arrays empty.  
++
++6. **Other Fields**:  
++   - `social_links`: Array of URLs explicitly listed in the document.  
++   - `languages`: Array of languages explicitly mentioned, including proficiency levels (e.g., "English (Native)", "French (Fluent)").  
++
++**Critical Instructions**:  
++- Extract data **only** from the provided document. Do not use external knowledge or assumptions.  
++- Match exact values (e.g., UK email format, phone number length, job titles).  
++- If a field is missing in the document, omit it or use an empty array/string.  
++- Ensure JSON validity and strict adherence to the schema.  
++- Use ISO 8601 timestamps for dates in work experience and include `isCurrent` flags.  
++
++Example Output (for reference):  
++```json  
++{  
++  "personal_info": {  
++    "name": "Sarah Mitchell",  
++    "statement": "Finance professional with expertise in...",  
++    "contact": { "email": "sarah.mitchell@uk.finance.com", "phone": "+44 20 7946 0958" }  
++  },  
++  "work_experience": [  
++    {  
++      "company": "Silverstone",  
++      "title": "Portfolio Analyst",  
++      "dates": "2019-02-28T23:00:00.000Z",  
++      "description": "Portfolio analysis for £250M+ investment fund",  
++      "isCurrent": false  
++    }  
++  ],  
++  "education": [  
++    {  
++      "institution": "Riverside University",  
++      "degree": "MSc Corporate Finance",  
++      "dates": "2015-09-01T00:00:00.000Z",  
++      "description": "Graduated with distinction, GPA 3.8"  
++    }  
++  ],  
++  "skills": ["Financial Expertise", "Technical Skills"],  
++  "publications": [],  
++  "certifications": [],  
++  "social_links": [],  
++  "languages": ["English (Native)", "French (Fluent)"]  
++}  
++```

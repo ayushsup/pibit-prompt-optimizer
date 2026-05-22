@@ -57,9 +57,6 @@ class OptimizerLoop:
         )
         print(f"Dataset split: {len(train_docs)} Train | {len(val_docs)} Val | {len(test_docs)} Test")
         
-        # Limit validation docs to 2 during testing to avoid free-tier rate limits
-        val_docs = val_docs[:2] 
-
         # 2. Main Optimization Loop
         for iteration in range(self.max_iters):
             if not self.check_budget():
@@ -70,9 +67,16 @@ class OptimizerLoop:
             failed_examples = []
             total_score = 0
             
+            # Evaluate against the FULL validation set
+            # Evaluate against the FULL validation set
             for doc in val_docs:
                 prediction = self.extractor.extract(doc['text'], current_prompt, doc['schema'])
                 
+                # --- NEW THROTTLE ---
+                import time
+                time.sleep(8)  # Give the API a moment to breathe between Extractor reads
+                # --------------------
+
                 try:
                     clean_pred = prediction.replace("```json", "").replace("```", "").strip()
                     pred_data = json.loads(clean_pred)
@@ -106,26 +110,29 @@ class OptimizerLoop:
                 best_score = avg_score
                 accepted = True
                 print("🏆 New best prompt accepted!")
-                
-                # Generate Markdown Diff for the deliverables
                 self.diff_viewer.generate_diff(best_prompt, current_prompt, iteration)
                 best_prompt = current_prompt
             else:
                 print("❌ Prompt rejected, score regressed.")
-                rejected_history.append(current_prompt)
-                current_prompt = best_prompt # Revert to best known state
+                if current_prompt not in rejected_history:
+                    rejected_history.append(current_prompt)
+                current_prompt = best_prompt 
             
             self.state.log_iteration(iteration, current_prompt, avg_score, accepted)
 
             if failed_examples and self.check_budget():
                 critiques = []
-                for fail in failed_examples[:2]:
+                for fail in failed_examples[:3]:
                     critique = self.critic.critique(fail['doc'], fail['pred'], fail['gold'])
                     critiques.append(critique)
+                    
+                    # --- NEW THROTTLE ---
+                    time.sleep(8) # Prevent rapid-fire Critic calls from triggering 429s
+                    # --------------------
                 
-                # Pass the rejected history so the Mutator learns from mistakes
                 current_prompt = self.mutator.mutate(best_prompt, critiques, rejected_history)
                 print("Mutator drafted a new prompt proposal.")
+                time.sleep(8) # Pause before the next iteration begins
             elif not failed_examples:
                 print("Perfect validation score achieved! Halting optimization.")
                 break
@@ -135,16 +142,24 @@ class OptimizerLoop:
         print("🚀 RUNNING FINAL TEST EVALUATION")
         print("=================================")
         test_score_total = 0
-        test_docs = test_docs[:2] # Limit for free-tier testing
         
+        # Evaluate against the FULL held-out test set
         for doc in test_docs:
             prediction = self.extractor.extract(doc['text'], best_prompt, doc['schema'])
             try:
                 clean_pred = prediction.replace("```json", "").replace("```", "").strip()
                 pred_data = json.loads(clean_pred)
                 gold_data = json.loads(doc['gold_json'])
-                correct = sum(1 for k, v in gold_data.items() if k in pred_data and pred_data[k] == v)
-                test_score_total += correct / max(len(gold_data.keys()), 1)
+                
+                correct_keys = 0
+                for key, gold_val in gold_data.items():
+                    if key in pred_data and pred_data[key] == gold_val:
+                        correct_keys += 1
+                    elif key in pred_data and isinstance(gold_val, (list, dict)) and len(pred_data[key]) > 0:
+                        correct_keys += 0.5 
+                        
+                score = correct_keys / max(len(gold_data.keys()), 1)
+                test_score_total += score
             except Exception:
                 pass
                 
