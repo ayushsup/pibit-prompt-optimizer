@@ -14,8 +14,9 @@ class BaseAgent:
         self.state_manager = state_manager
 
     def call_llm(self, system_prompt: str, user_prompt: str, role_name: str) -> str:
-        # Simple retry mechanism to handle Free Tier rate limits gracefully
-        max_retries = 3
+        max_retries = 5 # Increased retries to handle unstable network traffic
+        base_delay = 15
+        
         for attempt in range(max_retries):
             try:
                 response = self.client.chat.completions.create(
@@ -29,7 +30,7 @@ class BaseAgent:
                 
                 content = response.choices[0].message.content
                 
-                # Log the call (Cost is $0 on the free tier)
+                # Log the call
                 self.state_manager.log_llm_call(
                     role=role_name,
                     prompt=f"SYS: {system_prompt}\nUSER: {user_prompt}",
@@ -39,14 +40,26 @@ class BaseAgent:
                     cost=0.0 
                 )
                 
-                # Brief pause to respect the 15 RPM rate limit
+                # Brief pause to respect standard RPM limits
                 time.sleep(4) 
                 
                 return content
                 
             except Exception as e:
-                if "429" in str(e) and attempt < max_retries - 1:
-                    print(f"Rate limit hit for {role_name}. Sleeping for 60 seconds to reset quota...")
-                    time.sleep(60)
+                error_msg = str(e)
+                if attempt < max_retries - 1:
+                    if "429" in error_msg:
+                        # Exponential backoff for rate limits: 15s, 30s, 60s...
+                        delay = base_delay * (2 ** attempt) 
+                        print(f"⚠️ Rate limit (429) hit for {role_name}. Retrying in {delay}s...")
+                        time.sleep(delay)
+                    elif "503" in error_msg or "500" in error_msg:
+                        # Standard wait for server-side hiccups
+                        print(f"⚠️ Server overloaded (503). Retrying {role_name} in 20s...")
+                        time.sleep(20)
+                    else:
+                        # If it's a different error (like a 404 Bad Request), fail immediately
+                        raise e 
                 else:
+                    print(f"❌ Max retries reached for {role_name}. Failing gracefully.")
                     raise e

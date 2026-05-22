@@ -1,7 +1,10 @@
 import yaml
+import json
 from src.core.state_manager import StateManager
 from src.agents.critic_mutator import Extractor, Critic, Mutator
 from src.data.loader import ExtractBenchLoader
+from src.data.splitter import deterministic_split
+from src.optimizer.diff_viewer import DiffViewer
 
 class OptimizerLoop:
     def __init__(self, config_path: str):
@@ -12,23 +15,21 @@ class OptimizerLoop:
         self.extractor = Extractor(self.config['models']['extractor'], self.state)
         self.critic = Critic(self.config['models']['critic'], self.state)
         self.mutator = Mutator(self.config['models']['mutator'], self.state)
+        self.diff_viewer = DiffViewer()
 
-        # Setup data loader for real dataset
         dataset_cfg = self.config['dataset']
-        self.data = ExtractBenchLoader(
+        self.data_loader = ExtractBenchLoader(
             base_path=dataset_cfg['base_path'] + "/dataset",
             schema_name=dataset_cfg['name']
         )
-        # self.scorer = Scorer()
+        self.split_seed = dataset_cfg.get('split_seed', 42)
 
         self.budget_dollars = self.config['budget']['max_cost_dollars']
         self.max_iters = self.config['budget']['max_iterations']
 
     def check_budget(self) -> bool:
-        # Treat 0.0 as an unlimited financial budget (for free tiers/local models)
         if self.budget_dollars <= 0.0:
             return True
-            
         current_cost = self.state.get_total_cost()
         if current_cost >= self.budget_dollars:
             print(f"Budget exhausted (${current_cost:.2f} / ${self.budget_dollars:.2f}). Terminating.")
@@ -36,13 +37,30 @@ class OptimizerLoop:
         return True
 
     def run(self):
-        print(f"Starting Optimization Loop for Ayush Supakar...")
+        print(f"Starting Production Optimization Loop for Ayush Supakar...")
         current_prompt = self.config['seed_prompt']
+        best_prompt = current_prompt
         best_score = 0.0
+        rejected_history = []
         
-        # Load ONLY the first 2 validation documents to prevent rate limits during testing
-        val_docs = self.data.load_all_document_pairs()[:2]
+        # 1. Load and deterministically split the data
+        all_docs = self.data_loader.load_all_document_pairs()
+        if not all_docs:
+            print("No documents found. Check dataset path.")
+            return
+
+        train_docs, val_docs, test_docs = deterministic_split(
+            all_docs, 
+            seed=self.split_seed, 
+            train_ratio=0.5, 
+            val_ratio=0.2
+        )
+        print(f"Dataset split: {len(train_docs)} Train | {len(val_docs)} Val | {len(test_docs)} Test")
         
+        # Limit validation docs to 2 during testing to avoid free-tier rate limits
+        val_docs = val_docs[:2] 
+
+        # 2. Main Optimization Loop
         for iteration in range(self.max_iters):
             if not self.check_budget():
                 break
@@ -52,37 +70,24 @@ class OptimizerLoop:
             failed_examples = []
             total_score = 0
             
-            # 1. Evaluate current prompt
             for doc in val_docs:
                 prediction = self.extractor.extract(doc['text'], current_prompt, doc['schema'])
                 
-                # --- NEW REAL SCORING LOGIC ---
                 try:
-                    import json
-                    # Clean the LLM output in case it wrapped it in markdown
                     clean_pred = prediction.replace("```json", "").replace("```", "").strip()
                     pred_data = json.loads(clean_pred)
                     gold_data = json.loads(doc['gold_json'])
                     
-                    # Calculate a simple accuracy score based on matching top-level keys
                     correct_keys = 0
-                    total_keys = len(gold_data.keys())
-                    
                     for key, gold_val in gold_data.items():
-                        if key in pred_data:
-                            # If values match exactly, or both are populated lists/strings
-                            if pred_data[key] == gold_val:
-                                correct_keys += 1
-                            elif isinstance(gold_val, list) and isinstance(pred_data[key], list) and len(pred_data[key]) > 0:
-                                correct_keys += 0.5 # Partial credit for extracting array items
-                            elif isinstance(gold_val, str) and isinstance(pred_data[key], str) and len(pred_data[key]) > 0:
-                                correct_keys += 0.5 # Partial credit for extracting a string
-
-                    score = correct_keys / max(total_keys, 1)
-                except Exception as e:
-                    print(f"JSON Parse Error: Extractor failed to output valid JSON.")
-                    score = 0.0  # Total failure if JSON is invalid
-                # ------------------------------
+                        if key in pred_data and pred_data[key] == gold_val:
+                            correct_keys += 1
+                        elif key in pred_data and isinstance(gold_val, (list, dict)) and len(pred_data[key]) > 0:
+                            correct_keys += 0.5 
+                            
+                    score = correct_keys / max(len(gold_data.keys()), 1)
+                except Exception:
+                    score = 0.0  
                 
                 total_score += score
                 
@@ -96,31 +101,53 @@ class OptimizerLoop:
             avg_score = total_score / max(len(val_docs), 1)
             print(f"Validation Score: {avg_score:.4f}")
             
-            # 2. Accept or Reject
             accepted = False
             if avg_score > best_score:
                 best_score = avg_score
                 accepted = True
-                print("New best prompt accepted!")
+                print("🏆 New best prompt accepted!")
+                
+                # Generate Markdown Diff for the deliverables
+                self.diff_viewer.generate_diff(best_prompt, current_prompt, iteration)
+                best_prompt = current_prompt
             else:
-                print("Prompt rejected, score did not improve.")
+                print("❌ Prompt rejected, score regressed.")
+                rejected_history.append(current_prompt)
+                current_prompt = best_prompt # Revert to best known state
             
             self.state.log_iteration(iteration, current_prompt, avg_score, accepted)
 
-            # 3. Critique & Mutate
             if failed_examples and self.check_budget():
                 critiques = []
-                # Only critique a sample to save budget
-                for fail in failed_examples[:3]:
+                for fail in failed_examples[:2]:
                     critique = self.critic.critique(fail['doc'], fail['pred'], fail['gold'])
                     critiques.append(critique)
                 
-                current_prompt = self.mutator.mutate(current_prompt, critiques)
-                print("Mutator generated new prompt proposal.")
+                # Pass the rejected history so the Mutator learns from mistakes
+                current_prompt = self.mutator.mutate(best_prompt, critiques, rejected_history)
+                print("Mutator drafted a new prompt proposal.")
             elif not failed_examples:
-                print("Perfect score achieved on validation set. Stopping early.")
+                print("Perfect validation score achieved! Halting optimization.")
                 break
 
-        print("\nOptimization Complete.")
-        print(f"Final Best Score: {best_score:.4f}")
-        # In a full run, you would now evaluate `current_prompt` against the held-out test split here.
+        # 3. Final Test Set Evaluation (Assignment Deliverable)
+        print("\n=================================")
+        print("🚀 RUNNING FINAL TEST EVALUATION")
+        print("=================================")
+        test_score_total = 0
+        test_docs = test_docs[:2] # Limit for free-tier testing
+        
+        for doc in test_docs:
+            prediction = self.extractor.extract(doc['text'], best_prompt, doc['schema'])
+            try:
+                clean_pred = prediction.replace("```json", "").replace("```", "").strip()
+                pred_data = json.loads(clean_pred)
+                gold_data = json.loads(doc['gold_json'])
+                correct = sum(1 for k, v in gold_data.items() if k in pred_data and pred_data[k] == v)
+                test_score_total += correct / max(len(gold_data.keys()), 1)
+            except Exception:
+                pass
+                
+        final_test_score = test_score_total / max(len(test_docs), 1)
+        print(f"Final Held-Out Test Score: {final_test_score:.4f}")
+        print("Optimization Pipeline Complete. Diffs logged to /logs/diffs/")
