@@ -2,18 +2,19 @@ dataset:
   name: "hiring/resume"
   base_path: "./data/extract-bench"
   split_seed: 42
-  train_ratio: 0.05  # Tiny fraction of data for lightning-fast testing
-  val_ratio: 0.05    # Tiny fraction for quick validation scoring
+  train_ratio: 0.10   # Tiny fraction for fast smoke-test cycle
+  val_ratio: 0.10
 
 budget:
-  max_iterations: 20  # Keep your iteration limit
-  max_cost_dollars: 100.0  # Set high so the 0.0 >= 0.0 condition doesn't trigger
+  max_iterations: 5
+  max_cost_dollars: 0.0
 
 models:
-  extractor: "gemini-2.5-flash"
-  critic: "gemini-2.5-flash"
-  mutator: "gemini-2.5-pro"
-  
+  # Fast free-tier models for quick validation
+  extractor: "poolside/laguna-xs.2:free"
+  critic: "poolside/laguna-xs.2:free"
+  mutator: "poolside/laguna-xs.2:free"
+
 seed_prompt: |
   Extract the structured information from the provided document.
   Return ONLY valid JSON matching the exact schema. Do not include markdown formatting like ```json.

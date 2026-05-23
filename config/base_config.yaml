@@ -2,12 +2,16 @@ dataset:
   name: "hiring/resume"
   base_path: "./data/extract-bench"
   split_seed: 42
-  train_ratio: 0.6
+  train_ratio: 0.5
   val_ratio: 0.2
 
 budget:
   max_iterations: 20
-  max_cost_dollars: 0.0
+  max_cost_dollars: 0.0   # 0 = no dollar cap (free tier via OpenRouter)
+
+# vision_model is used as an OCR fallback for scanned/image-based PDFs.
+# Must be a vision-capable model available on OpenRouter.
+vision_model: "google/gemini-2.0-flash-exp:free"
 
 models:
   extractor: "poolside/laguna-xs.2:free"
@@ -15,5 +19,45 @@ models:
   mutator: "poolside/laguna-xs.2:free"
 
 seed_prompt: |
-  Extract the structured information from the provided document.
-  Return ONLY valid JSON matching the exact schema. Do not include markdown formatting like ```json.
+  You are a professional resume data extraction system.
+
+  Extract ALL structured information from the provided resume document and return it as valid JSON.
+
+  FIELD-BY-FIELD EXTRACTION RULES:
+
+  1. contact:
+     - email: exact email address as written (preserve case)
+     - phone: exact phone number including country code if shown (e.g. "+44 7700 900123")
+     - name: full name exactly as it appears at the top of the document
+
+  2. work_experience (array of objects, most recent first):
+     - company: exact company name
+     - title: exact job title
+     - dates: ISO 8601 format (e.g. "2020-01-01T00:00:00.000Z")
+     - isCurrent: true if the role is ongoing, false otherwise
+     - description: summary of responsibilities as written
+     - Include media and other fields ONLY if explicitly present in the document
+
+  3. education (array of objects):
+     - institution: exact institution name
+     - degree: full degree title as written
+     - dates: ISO 8601 format
+     - description: include GPA, merit, honours if mentioned
+
+  4. skills:
+     - Return an object with categorised keys (e.g. "Technical Skills", "Soft Skills")
+     - Each key maps to an array of skill strings explicitly mentioned
+     - Do NOT infer, add, or generalise skills
+
+  5. publications: array of strings; empty [] if absent
+  6. certifications: array of strings; empty [] if absent
+  7. social_links: array of URLs exactly as written; empty [] if absent
+  8. languages: array with proficiency levels (e.g. "French (Fluent)"); empty [] if absent
+
+  CRITICAL RULES:
+  - Extract data ONLY from the provided document. Do not use external knowledge.
+  - Return ONLY valid JSON. No markdown fences, no preamble, no explanation.
+  - If a field is absent from the document, use null for scalars or [] for arrays.
+  - Preserve exact spelling, capitalisation, and punctuation for all extracted values.
+  - Dates must always be ISO 8601 timestamps, not plain strings like "Jan 2020".
+

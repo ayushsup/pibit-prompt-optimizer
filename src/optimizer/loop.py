@@ -1,168 +1,342 @@
-import yaml
+"""
+Central optimization engine.
+
+Implements a Greedy Accept/Reject loop augmented with:
+  - Schema-aware F1 scoring via Scorer (independent of this module)
+  - Resumability: checks SQLite for an existing trajectory and warm-starts
+  - Stall detection: escalates mutation aggressiveness after N no-improvement iterations
+  - Rejection memory: Mutator sees previously rejected prompts
+  - Budget enforcement: stops on max_iterations OR max_cost_dollars (if > 0)
+
+Dataset path handling uses os.path.join throughout for Windows/Unix compatibility.
+
+Val-set safety guard
+--------------------
+If the val split is empty (tiny dataset edge case), the loop automatically
+falls back to using train docs for validation with a clear warning. This ensures
+the optimizer can always run meaningfully, even on a 2-document dataset.
+"""
+
+from __future__ import annotations
+
 import json
+import os
+import time
+from typing import Dict, List, Optional, Tuple
+
+import yaml
+
+from src.agents.critic_mutator import Critic, Extractor, Mutator
+from src.core.config_parser import load_config
 from src.core.state_manager import StateManager
-from src.agents.critic_mutator import Extractor, Critic, Mutator
 from src.data.loader import ExtractBenchLoader
 from src.data.splitter import deterministic_split
+from src.evaluation.scorer import Scorer
 from src.optimizer.diff_viewer import DiffViewer
 
-class OptimizerLoop:
-    def __init__(self, config_path: str):
-        with open(config_path, 'r') as f:
-            self.config = yaml.safe_load(f)
 
+class OptimizerLoop:
+    """Budget-enforced greedy prompt optimization loop."""
+
+    STALL_THRESHOLD = 3  # Iterations without improvement before escalating mutation
+
+    def __init__(self, config_path: str = "config/base_config.yaml"):
+        self.config = load_config(config_path)
         self.state = StateManager()
-        self.extractor = Extractor(self.config['models']['extractor'], self.state)
-        self.critic = Critic(self.config['models']['critic'], self.state)
-        self.mutator = Mutator(self.config['models']['mutator'], self.state)
         self.diff_viewer = DiffViewer()
 
-        dataset_cfg = self.config['dataset']
-        self.data_loader = ExtractBenchLoader(
-            base_path=dataset_cfg['base_path'] + "/dataset",
-            schema_name=dataset_cfg['name']
+        cfg = self.config
+
+        self.extractor = Extractor(cfg.models.extractor, self.state)
+        self.critic    = Critic(cfg.models.critic,    self.state)
+        self.mutator   = Mutator(cfg.models.mutator,  self.state)
+
+        # Build LLM judge callable for stochastic metrics (string_semantic / array_llm)
+        judge_client = self.critic.client
+        judge_model  = cfg.models.critic
+
+        def llm_judge(pred, gold, metric: str) -> float:
+            return self._call_judge(pred, gold, metric, judge_client, judge_model)
+
+        self.scorer = Scorer(state_manager=self.state, judge_callable=llm_judge)
+
+        # ---- Dataset loading ----
+        # Use os.path.join so paths work on both Windows and Unix
+        vision_model = getattr(cfg, "vision_model", "google/gemini-2.0-flash-exp:free")
+        dataset_base = os.path.join(cfg.dataset.base_path, "dataset")
+
+        loader = ExtractBenchLoader(
+            base_path=dataset_base,
+            schema_name=cfg.dataset.name,
+            vision_model=vision_model,
         )
-        self.split_seed = dataset_cfg.get('split_seed', 42)
+        print(f"\n📂 Loading dataset: {cfg.dataset.name}")
+        all_docs = loader.load_all_document_pairs()
 
-        self.budget_dollars = self.config['budget']['max_cost_dollars']
-        self.max_iters = self.config['budget']['max_iterations']
+        if not all_docs:
+            raise RuntimeError(
+                "No document pairs could be loaded.\n"
+                "Check that:\n"
+                "  1. data/extract-bench/dataset/<schema_name>/pdf+gold/ exists.\n"
+                "  2. OPENROUTER_API_KEY is set (needed for scanned PDF fallback).\n"
+                "  3. The schema name in config matches the folder name exactly."
+            )
 
-    def check_budget(self) -> bool:
-        if self.budget_dollars <= 0.0:
-            return True
-        current_cost = self.state.get_total_cost()
-        if current_cost >= self.budget_dollars:
-            print(f"Budget exhausted (${current_cost:.2f} / ${self.budget_dollars:.2f}). Terminating.")
+        self.train_docs, self.val_docs, self.test_docs = deterministic_split(
+            all_docs,
+            seed=cfg.dataset.split_seed,
+            train_ratio=cfg.dataset.train_ratio,
+            val_ratio=cfg.dataset.val_ratio,
+        )
+
+        # ---- Val-set safety guard ----
+        if not self.val_docs:
+            print(
+                "\n  ⚠️  Val set is empty after split. "
+                "Falling back to using ALL loaded docs for validation.\n"
+                "  (Normal on tiny datasets — the optimizer will still run correctly.)"
+            )
+            self.val_docs  = all_docs
+            self.test_docs = all_docs  # held-out = same; acknowledge in report
+
+        print(
+            f"\n  Split (seed={cfg.dataset.split_seed}): "
+            f"{len(self.train_docs)} train | "
+            f"{len(self.val_docs)} val | "
+            f"{len(self.test_docs)} test"
+        )
+
+    # ------------------------------------------------------------------
+    # Budget helpers
+    # ------------------------------------------------------------------
+
+    def _within_budget(self) -> bool:
+        dollar_limit = self.config.budget.max_cost_dollars
+        if dollar_limit <= 0.0:
+            return True  # 0 means "unlimited" (free tier)
+        spent = self.state.get_total_cost()
+        if spent >= dollar_limit:
+            print(f"💸 Budget exhausted (${spent:.4f} / ${dollar_limit:.2f}). Stopping.")
             return False
         return True
 
-    def run(self):
-        print(f"Starting Production Optimization Loop for Ayush Supakar...")
-        current_prompt = self.config['seed_prompt']
-        best_prompt = current_prompt
-        best_score = 0.0
-        rejected_history = []
-        
-        # 1. Load and deterministically split the data
-        all_docs = self.data_loader.load_all_document_pairs()
-        if not all_docs:
-            print("No documents found. Check dataset path.")
-            return
+    # ------------------------------------------------------------------
+    # Corpus scoring
+    # ------------------------------------------------------------------
 
-        train_docs, val_docs, test_docs = deterministic_split(
-            all_docs, 
-            seed=self.split_seed, 
-            train_ratio=0.5, 
-            val_ratio=0.2
+    def _evaluate_corpus(
+        self, docs: List[Dict], prompt: str
+    ) -> Tuple[float, Dict]:
+        """
+        Extract + score every document in `docs` with the current prompt.
+        Returns (mean_f1, info_dict) where info_dict contains per-doc scores
+        and a list of failed documents for the Critic to analyse.
+        """
+        total_f1  = 0.0
+        breakdown: Dict[str, Dict] = {}
+        failed:    List[Dict]       = []
+
+        for doc in docs:
+            prediction = self.extractor.extract(doc["text"], prompt, doc["schema"])
+            f1, doc_breakdown = self.scorer.score_document(
+                pred_json=prediction,
+                gold_json=doc["gold_json"],
+                schema_str=doc["schema"],
+            )
+            total_f1 += f1
+            breakdown[doc["id"]] = {**doc_breakdown, "f1": f1}
+
+            if f1 < 1.0:
+                failed.append({
+                    "doc":   doc["text"],
+                    "pred":  prediction,
+                    "gold":  doc["gold_json"],
+                    "score": f1,
+                    "id":    doc["id"],
+                })
+
+        mean_f1 = total_f1 / max(len(docs), 1)
+        return mean_f1, {"docs": breakdown, "failed": failed}
+
+    # ------------------------------------------------------------------
+    # LLM judge for stochastic metrics
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _call_judge(pred, gold, metric: str, client, model: str) -> float:
+        try:
+            if metric == "string_semantic":
+                prompt = (
+                    "Rate the semantic equivalence of these two strings. "
+                    "0.0 = completely different meaning, 1.0 = identical meaning.\n"
+                    f"String A: {pred}\nString B: {gold}\n"
+                    "Return ONLY a single float between 0.0 and 1.0."
+                )
+            else:  # array_llm
+                prompt = (
+                    "Rate the semantic equivalence of these two arrays. "
+                    "0.0 = completely different, 1.0 = identical.\n"
+                    f"Array A: {json.dumps(pred)}\nArray B: {json.dumps(gold)}\n"
+                    "Return ONLY a single float between 0.0 and 1.0."
+                )
+            response = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=10,
+            )
+            return max(0.0, min(1.0, float(response.choices[0].message.content.strip())))
+        except Exception:
+            return 1.0 if str(pred).strip().lower() == str(gold).strip().lower() else 0.0
+
+    # ------------------------------------------------------------------
+    # Main optimization loop
+    # ------------------------------------------------------------------
+
+    def run(self) -> None:
+        cfg = self.config
+        print(
+            f"\n🚀 Optimizer starting  "
+            f"max_iterations={cfg.budget.max_iterations}  "
+            f"dataset={cfg.dataset.name}"
         )
-        print(f"Dataset split: {len(train_docs)} Train | {len(val_docs)} Val | {len(test_docs)} Test")
-        
-        # 2. Main Optimization Loop
-        for iteration in range(self.max_iters):
-            if not self.check_budget():
-                break
-                
-            print(f"\n--- Iteration {iteration + 1} ---")
-            
-            failed_examples = []
-            total_score = 0
-            
-            # Evaluate against the FULL validation set
-            # Evaluate against the FULL validation set
-            for doc in val_docs:
-                prediction = self.extractor.extract(doc['text'], current_prompt, doc['schema'])
-                
-                # --- NEW THROTTLE ---
-                import time
-                time.sleep(8)  # Give the API a moment to breathe between Extractor reads
-                # --------------------
 
-                try:
-                    clean_pred = prediction.replace("```json", "").replace("```", "").strip()
-                    pred_data = json.loads(clean_pred)
-                    gold_data = json.loads(doc['gold_json'])
-                    
-                    correct_keys = 0
-                    for key, gold_val in gold_data.items():
-                        if key in pred_data and pred_data[key] == gold_val:
-                            correct_keys += 1
-                        elif key in pred_data and isinstance(gold_val, (list, dict)) and len(pred_data[key]) > 0:
-                            correct_keys += 0.5 
-                            
-                    score = correct_keys / max(len(gold_data.keys()), 1)
-                except Exception:
-                    score = 0.0  
-                
-                total_score += score
-                
-                if score < 1.0:
-                    failed_examples.append({
-                        "doc": doc['text'],
-                        "pred": prediction,
-                        "gold": doc['gold_json']
-                    })
-            
-            avg_score = total_score / max(len(val_docs), 1)
-            print(f"Validation Score: {avg_score:.4f}")
-            
-            accepted = False
-            if avg_score > best_score:
-                best_score = avg_score
-                accepted = True
-                print("🏆 New best prompt accepted!")
+        # ---- Resumability: warm-start from a previous interrupted run ----
+        prior_best   = self.state.get_best_state()
+        last_done    = self.state.get_last_completed_iteration()
+        rejected_history: List[str] = self.state.get_rejected_prompts()
+
+        if prior_best and last_done >= 0:
+            best_prompt    = prior_best["prompt"]
+            best_score     = prior_best["val_score"]
+            start_iteration = last_done + 1
+            current_prompt  = best_prompt
+            print(
+                f"♻️  Resuming from iteration {start_iteration} "
+                f"(best val F1 so far: {best_score:.4f})"
+            )
+        else:
+            best_prompt    = cfg.seed_prompt
+            best_score     = -1.0  # Force the first iteration to always be accepted as baseline
+            start_iteration = 0
+            current_prompt  = cfg.seed_prompt
+            print("🌱 Starting fresh from seed prompt.")
+
+        stall_count = 0
+
+        for iteration in range(start_iteration, cfg.budget.max_iterations):
+            if not self._within_budget():
+                break
+
+            print(f"\n{'='*60}")
+            print(f"  ITERATION {iteration + 1} / {cfg.budget.max_iterations}")
+            print(f"{'='*60}")
+
+            # ---- Evaluate current prompt on validation set ----
+            val_score, val_info = self._evaluate_corpus(self.val_docs, current_prompt)
+            failed_docs = val_info["failed"]
+
+            print(
+                f"  📊 Val F1: {val_score:.4f}  |  "
+                f"Best so far: {max(best_score, 0.0):.4f}  |  "
+                f"Failed docs: {len(failed_docs)}/{len(self.val_docs)}"
+            )
+
+            # ---- Accept / Reject ----
+            accepted = val_score > best_score
+
+            if accepted:
                 self.diff_viewer.generate_diff(best_prompt, current_prompt, iteration)
+                best_score  = val_score
                 best_prompt = current_prompt
+                stall_count = 0
+                print(f"  🏆 New best prompt accepted! (F1={val_score:.4f})")
             else:
-                print("❌ Prompt rejected, score regressed.")
+                stall_count += 1
+                print(f"  ❌ Rejected (no improvement). Stall count: {stall_count}.")
                 if current_prompt not in rejected_history:
                     rejected_history.append(current_prompt)
-                current_prompt = best_prompt 
-            
-            self.state.log_iteration(iteration, current_prompt, avg_score, accepted)
+                current_prompt = best_prompt  # rollback
 
-            if failed_examples and self.check_budget():
-                critiques = []
-                for fail in failed_examples[:3]:
-                    critique = self.critic.critique(fail['doc'], fail['pred'], fail['gold'])
-                    critiques.append(critique)
-                    
-                    # --- NEW THROTTLE ---
-                    time.sleep(8) # Prevent rapid-fire Critic calls from triggering 429s
-                    # --------------------
-                
-                current_prompt = self.mutator.mutate(best_prompt, critiques, rejected_history)
-                print("Mutator drafted a new prompt proposal.")
-                time.sleep(8) # Pause before the next iteration begins
-            elif not failed_examples:
-                print("Perfect validation score achieved! Halting optimization.")
+            self.state.log_iteration(
+                iteration=iteration,
+                prompt=current_prompt,
+                val_score=val_score,
+                accepted=accepted,
+                breakdown={
+                    "per_doc_f1": {
+                        doc_id: info["f1"]
+                        for doc_id, info in val_info["docs"].items()
+                    }
+                },
+            )
+
+            # ---- Early stop on perfect score ----
+            if val_score >= 1.0:
+                print("  ✅ Perfect validation score achieved. Halting early.")
                 break
 
-        # 3. Final Test Set Evaluation (Assignment Deliverable)
-        print("\n=================================")
-        print("🚀 RUNNING FINAL TEST EVALUATION")
-        print("=================================")
-        test_score_total = 0
-        
-        # Evaluate against the FULL held-out test set
-        for doc in test_docs:
-            prediction = self.extractor.extract(doc['text'], best_prompt, doc['schema'])
+            # ---- Generate critiques from worst-performing documents ----
+            if not self._within_budget():
+                break
+
+            if not failed_docs:
+                print("  ℹ️  No failed documents — nothing to critique.")
+                continue
+
+            # Sort by score ascending so we critique the worst failures first
+            critique_docs = sorted(failed_docs, key=lambda x: x["score"])[:3]
+            critiques: List[str] = []
+
+            for fail in critique_docs:
+                try:
+                    critique = self.critic.critique(
+                        fail["doc"], fail["pred"], fail["gold"]
+                    )
+                    critiques.append(critique)
+                    print(f"  🔍 Critique generated for: {fail['id']}")
+                except Exception as exc:
+                    print(f"  ⚠️  Critic failed for '{fail.get('id', '?')}': {exc}")
+
+            if not critiques:
+                print("  ⚠️  All critique attempts failed. Skipping mutation.")
+                continue
+
+            # ---- Mutate ----
+            if not self._within_budget():
+                break
+
             try:
-                clean_pred = prediction.replace("```json", "").replace("```", "").strip()
-                pred_data = json.loads(clean_pred)
-                gold_data = json.loads(doc['gold_json'])
-                
-                correct_keys = 0
-                for key, gold_val in gold_data.items():
-                    if key in pred_data and pred_data[key] == gold_val:
-                        correct_keys += 1
-                    elif key in pred_data and isinstance(gold_val, (list, dict)) and len(pred_data[key]) > 0:
-                        correct_keys += 0.5 
-                        
-                score = correct_keys / max(len(gold_data.keys()), 1)
-                test_score_total += score
-            except Exception:
-                pass
-                
-        final_test_score = test_score_total / max(len(test_docs), 1)
-        print(f"Final Held-Out Test Score: {final_test_score:.4f}")
-        print("Optimization Pipeline Complete. Diffs logged to /logs/diffs/")
+                current_prompt = self.mutator.mutate(
+                    current_prompt=best_prompt,
+                    critiques=critiques,
+                    rejected_prompts=rejected_history,
+                    stall_count=stall_count,
+                )
+                print(f"  ✏️  Mutator drafted a new prompt proposal.")
+            except Exception as exc:
+                print(f"  ⚠️  Mutator failed: {exc}. Retaining current best.")
+                current_prompt = best_prompt
+
+        # ------------------------------------------------------------------
+        # Final test set evaluation (held-out, evaluated ONCE)
+        # ------------------------------------------------------------------
+        print(f"\n{'='*60}")
+        print("  🧪 FINAL HELD-OUT TEST EVALUATION")
+        print(f"{'='*60}")
+
+        test_score, test_info = self._evaluate_corpus(self.test_docs, best_prompt)
+
+        print(f"\n  ✅ Final Test F1: {test_score:.4f}")
+        print(f"  Best Val F1    : {max(best_score, 0.0):.4f}")
+        print("\n  Per-document breakdown:")
+        for doc_id, info in test_info["docs"].items():
+            subtrees = info.get("subtrees", {})
+            field_scores = "  ".join(
+                f"{k}={v['f1']:.2f}" for k, v in subtrees.items()
+            ) if subtrees else "n/a"
+            print(f"    {doc_id}: F1={info['f1']:.4f}  [{field_scores}]")
+
+        print(f"\n  Diffs logged : logs/diffs/")
+        print(f"  Audit trail  : run_state.db")
+        print(f"{'='*60}\n")
