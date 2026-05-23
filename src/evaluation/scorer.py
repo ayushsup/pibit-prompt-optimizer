@@ -5,6 +5,12 @@ Computes per-leaf precision, recall, and F1 by traversing the JSON Schema
 alongside the predicted and gold JSON objects. Aggregates micro-averaged
 metrics across all leaf fields and provides per-subtree breakdowns.
 
+Schema Format
+-------------
+ExtractBench schema files wrap the actual JSON Schema inside a
+"schema_definition" key. This module automatically unwraps that envelope
+before scoring, so callers can pass the raw schema file contents.
+
 Array Alignment Policy
 ----------------------
 - Arrays of objects  : Positional (index-based) alignment. Item i in the
@@ -16,6 +22,19 @@ Array Alignment Policy
 
 This policy is documented here and in the README. It is deterministic and
 reproducible given the same inputs.
+
+anyOf Handling
+--------------
+Fields declared with "anyOf" (common in ExtractBench for nullable fields
+and polymorphic date/skill types) are resolved by selecting the schema
+variant that matches the gold value's actual Python type. When multiple
+non-null variants match, the one yielding the highest F1 is chosen.
+
+additionalProperties Handling
+------------------------------
+Object schemas that use "additionalProperties" (e.g., the grouped skills
+object) are scored by iterating over every key present in the gold object
+and evaluating each value against the additionalProperties schema.
 
 Stochastic Metrics
 ------------------
@@ -129,6 +148,9 @@ class Scorer:
         """
         Score a single (prediction, gold) pair against the schema.
 
+        Automatically unwraps the ExtractBench "schema_definition" envelope
+        so callers can pass the raw schema file contents directly.
+
         Returns
         -------
         (aggregate_f1, breakdown_dict)
@@ -143,6 +165,10 @@ class Scorer:
             schema = json.loads(schema_str)
         except (json.JSONDecodeError, Exception) as exc:
             return 0.0, {"error": f"Failed to parse gold/schema: {exc}"}
+
+        # Unwrap ExtractBench schema envelope
+        if "schema_definition" in schema:
+            schema = schema["schema_definition"]
 
         result = self._score_object(pred, gold, schema, path="root")
         return result.f1, result.to_dict()
@@ -178,18 +204,30 @@ class Scorer:
             return result
 
         pred = pred if isinstance(pred, dict) else {}
-        properties = schema_node.get("properties", {})
 
+        # --- Handle schemas using additionalProperties (e.g. grouped skills) ---
+        if "additionalProperties" in schema_node and "properties" not in schema_node:
+            add_prop_schema = schema_node["additionalProperties"]
+            for key, gold_val in gold.items():
+                pred_val = pred.get(key)
+                field_result = self._score_field(
+                    pred_val, gold_val, add_prop_schema, path=f"{path}.{key}"
+                )
+                result.merge(field_result)
+                result.subtrees[key] = field_result
+            return result
+
+        # --- Standard property-based object ---
+        properties = schema_node.get("properties", {})
         for field_name, field_schema in properties.items():
             gold_val = gold.get(field_name)
-            pred_val = pred.get(field_name)
 
             if gold_val is None and field_name not in gold:
-                # Field not present in gold at all — skip
+                # Field absent in gold entirely — skip
                 continue
 
             field_result = self._score_field(
-                pred_val,
+                pred.get(field_name),
                 gold_val,
                 field_schema,
                 path=f"{path}.{field_name}",
@@ -206,6 +244,10 @@ class Scorer:
         field_schema: Dict,
         path: str,
     ) -> ScoreResult:
+        # Handle anyOf (nullable fields, polymorphic types)
+        if "anyOf" in field_schema:
+            return self._score_any_of(pred_val, gold_val, field_schema["anyOf"], path)
+
         field_type = field_schema.get("type", "string")
 
         if field_type == "array":
@@ -216,6 +258,54 @@ class Scorer:
 
         # Leaf scalar
         return self._score_leaf(pred_val, gold_val, field_schema)
+
+    def _score_any_of(
+        self,
+        pred_val: Any,
+        gold_val: Any,
+        any_of_schemas: List[Dict],
+        path: str,
+    ) -> ScoreResult:
+        """
+        Score a field declared with anyOf.
+
+        Strategy:
+        1. If gold is None, nothing to score (field is null in gold).
+        2. Identify which non-null schema variant matches gold's actual type.
+        3. Score with type-matched candidates; fall back to all non-null if none match.
+        4. Return the result with the highest F1 / most gold_count.
+        """
+        if gold_val is None:
+            return ScoreResult()
+
+        non_null = [s for s in any_of_schemas if s.get("type") != "null"]
+        if not non_null:
+            return ScoreResult()
+
+        # Map Python type to JSON schema type
+        _type_map = {
+            str: "string",
+            int: "integer",
+            float: "number",
+            bool: "boolean",
+            list: "array",
+            dict: "object",
+        }
+        gold_schema_type = _type_map.get(type(gold_val), "string")
+        matching = [s for s in non_null if s.get("type") == gold_schema_type]
+        candidates = matching if matching else non_null
+
+        best_result = ScoreResult()
+        best_f1 = -1.0
+        for schema in candidates:
+            r = self._score_field(pred_val, gold_val, schema, path)
+            if r.f1 > best_f1 or (
+                r.f1 == best_f1 and r.gold_count > best_result.gold_count
+            ):
+                best_f1 = r.f1
+                best_result = r
+
+        return best_result
 
     def _score_leaf(
         self,
@@ -249,9 +339,14 @@ class Scorer:
 
         pred_arr = pred_arr if isinstance(pred_arr, list) else []
         items_schema = field_schema.get("items", {})
-        items_type = items_schema.get("type", "string")
 
-        # eval_config can be on the array field or on its items
+        # Resolve items type, handling anyOf on items
+        if "anyOf" in items_schema:
+            non_null_items = [s for s in items_schema["anyOf"] if s.get("type") != "null"]
+            items_type = non_null_items[0].get("type", "string") if non_null_items else "string"
+        else:
+            items_type = items_schema.get("type", "string")
+
         eval_config = field_schema.get(
             "evaluation_config",
             items_schema.get("evaluation_config", "string_exact"),
@@ -266,11 +361,11 @@ class Scorer:
 
                 if gold_item is None:
                     # Extra prediction item → count predicted leaves as FP
-                    fp_result = self._count_leaves(pred_item or {}, items_schema)
-                    result.predicted_count += fp_result
+                    fp_count = self._count_leaves(pred_item or {}, items_schema)
+                    result.predicted_count += fp_count
                 elif pred_item is None:
-                    fn_result = self._count_leaves(gold_item, items_schema)
-                    result.gold_count += fn_result
+                    fn_count = self._count_leaves(gold_item, items_schema)
+                    result.gold_count += fn_count
                 else:
                     item_result = self._score_object(
                         pred_item, gold_item, items_schema, path=f"{path}[{i}]"
@@ -293,7 +388,7 @@ class Scorer:
                     )
                     result.true_positives += best
             else:
-                # Exact set intersection
+                # Exact set intersection (normalise to lowercase strings)
                 gold_norm = {str(g).strip().lower() for g in gold_arr}
                 pred_norm = {str(p).strip().lower() for p in pred_arr}
                 result.true_positives = float(len(gold_norm & pred_norm))
@@ -324,7 +419,7 @@ class Scorer:
         if self.judge_callable:
             score = self.judge_callable(pred, gold, metric)
         else:
-            # No judge available: graceful fallback
+            # No judge available: graceful fallback to exact match
             score = string_exact(str(pred), str(gold))
 
         if self.state_manager:
@@ -338,10 +433,17 @@ class Scorer:
 
     @staticmethod
     def _clean_json(text: str) -> str:
-        return text.replace("```json", "").replace("```", "").strip()
+        """Strip markdown code fences that some models add around JSON output."""
+        text = text.strip()
+        if text.startswith("```"):
+            lines = text.split("\n")
+            # Drop first line (```json or ```) and last line (```)
+            inner = lines[1:-1] if lines[-1].strip() == "```" else lines[1:]
+            text = "\n".join(inner).strip()
+        return text
 
     def _count_leaves(self, obj: Any, schema_node: Dict) -> int:
-        """Count the number of scoreable leaf fields in a schema node."""
+        """Count the number of scoreable leaf fields in a schema subtree."""
         if not isinstance(obj, dict):
             return 1
         count = 0

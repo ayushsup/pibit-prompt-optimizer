@@ -5,6 +5,7 @@ Supported evaluation_config values (as defined in ExtractBench schemas):
   - string_exact      : Case-insensitive exact string match
   - integer_exact     : Exact integer match with type coercion
   - number_tolerance  : Numeric match within 5% relative tolerance
+  - boolean_exact     : Exact boolean match with type coercion
   - string_semantic   : Semantic similarity via LLM judge (cached)
   - array_llm         : LLM-based evaluation of array equivalence (cached)
 
@@ -53,6 +54,26 @@ def number_tolerance(pred: Any, gold: Any, tolerance: float = 0.05) -> float:
         return 0.0
 
 
+def boolean_exact(pred: Any, gold: Any) -> float:
+    """
+    Exact boolean match with type coercion.
+    Handles Python bools, strings ('true'/'false'/'yes'/'no'/'1'/'0'), and integers.
+    """
+    def to_bool(v: Any) -> bool:
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, int):
+            return bool(v)
+        if isinstance(v, str):
+            return v.strip().lower() in ("true", "1", "yes")
+        return False
+
+    try:
+        return 1.0 if to_bool(pred) == to_bool(gold) else 0.0
+    except Exception:
+        return 0.0
+
+
 # ---------------------------------------------------------------------------
 # Cache key helpers for stochastic metrics
 # ---------------------------------------------------------------------------
@@ -77,9 +98,10 @@ def compute_cache_key(metric: str, pred: Any, gold: Any) -> str:
 # ---------------------------------------------------------------------------
 
 DETERMINISTIC_METRICS = {
-    "string_exact": string_exact,
-    "integer_exact": integer_exact,
+    "string_exact":     string_exact,
+    "integer_exact":    integer_exact,
     "number_tolerance": number_tolerance,
+    "boolean_exact":    boolean_exact,
 }
 
 STOCHASTIC_METRICS = {"string_semantic", "array_llm"}

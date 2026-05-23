@@ -1,12 +1,12 @@
 """
 Agentic components of the optimization pipeline.
 
-Extractor : Produces structured JSON from raw document text.
-Critic    : Performs semantic diff between prediction and gold standard,
-            identifying specific failure modes with actionable labels.
-Mutator   : Prompt engineer agent that synthesizes critiques into a
-            non-regressive prompt improvement, maintaining a rejection
-            memory to avoid re-proposing failed variants.
+Extractor : Produces structured JSON from raw document text using the current prompt.
+Critic    : Performs a surgical semantic diff between prediction and gold standard,
+            identifying specific failure modes with actionable, field-level labels.
+Mutator   : Prompt-engineer agent that synthesizes critiques into a non-regressive
+            prompt improvement, maintaining a rejection memory to avoid re-proposing
+            failed variants and escalating boldness during stalls.
 """
 
 from __future__ import annotations
@@ -23,14 +23,15 @@ class Extractor(BaseAgent):
 
     _SYSTEM_TEMPLATE = """{current_prompt}
 
-TARGET SCHEMA:
+TARGET SCHEMA (JSON Schema):
 {schema}
 
-CRITICAL OUTPUT RULES:
-- Return ONLY valid JSON. No markdown fences, no commentary, no preamble.
-- Every key in the schema must appear in your output (use null or [] for absent values).
-- Do not invent data not present in the document.
-- Dates must follow ISO 8601 format where the schema specifies timestamps.
+OUTPUT RULES (non-negotiable):
+- Return ONLY valid JSON that conforms to the schema above. No markdown fences, no commentary, no preamble.
+- Every top-level key defined in the schema MUST appear in your output (use null for absent scalars, [] for absent arrays).
+- Do NOT invent or hallucinate data that is not explicitly present in the document.
+- Preserve exact spelling, capitalisation, and punctuation for all extracted string values.
+- For fields with anyOf containing null: output null if the value is genuinely absent.
 """
 
     def extract(self, document_text: str, current_prompt: str, schema: str) -> str:
@@ -42,7 +43,7 @@ CRITICAL OUTPUT RULES:
             system_prompt=system_prompt,
             user_prompt=f"DOCUMENT:\n{document_text}",
             role_name="Extractor",
-            temperature=0.1,  # Near-deterministic for extraction
+            temperature=0.0,  # Fully deterministic for extraction
         )
 
 
@@ -54,26 +55,28 @@ class Critic(BaseAgent):
     """
     Analyses extraction failures and returns structured, actionable critiques.
 
-    The output is designed to be directly consumable by the Mutator:
-    each critique identifies a failure category (missing key, wrong type,
-    hallucination, format error, etc.) plus the specific field and evidence.
+    The output format is designed to be directly consumable by the Mutator:
+    each entry identifies a failure category, the specific field path, the
+    predicted vs gold values, and a concrete one-sentence fix instruction.
     """
 
-    _SYSTEM_PROMPT = """You are a precision data-extraction auditor.
+    _SYSTEM_PROMPT = """You are a precision data-extraction auditor specialising in JSON schema compliance.
 
-Your job is to compare a JSON extraction against the gold-standard annotation
-and diagnose exactly why they differ.
+Your task: compare a predicted JSON extraction against the gold-standard annotation and produce
+actionable, field-level diagnoses that a prompt engineer can act on immediately.
 
-For EACH discrepancy, output a critique in this exact format:
-  [FIELD: <field_path>] [TYPE: <MISSING|WRONG_VALUE|TYPE_MISMATCH|HALLUCINATED|FORMAT_ERROR|ARRAY_MISMATCH>]
-  Predicted: <value or 'ABSENT'>
+For EACH discrepancy, output a critique in EXACTLY this format:
+  [FIELD: <dot.path.to.field>] [TYPE: <MISSING|WRONG_VALUE|TYPE_MISMATCH|HALLUCINATED|FORMAT_ERROR|ARRAY_MISMATCH|NULL_WHEN_PRESENT>]
+  Predicted: <value or 'ABSENT' or 'null'>
   Gold:      <value>
-  Fix:       <one-sentence actionable instruction for the prompt author>
+  Fix:       <one concrete instruction for improving the extraction prompt>
 
 Rules:
-- Be surgical: do not mention fields that match correctly.
-- Focus on the top 5 most impactful failures if there are many.
-- Do NOT suggest model fine-tuning or data changes — only prompt wording fixes.
+- Be surgical: skip fields that match correctly.
+- Prioritise the top 5 most impactful failures (those affecting the most leaf fields).
+- Consider type mismatches (e.g. string "2020" vs integer 2020, missing array vs null scalar).
+- Consider field name mismatches (e.g. model outputs "company" but schema expects "employer").
+- Do NOT suggest model fine-tuning, data changes, or post-processing — only prompt wording fixes.
 - If the extraction is perfect, output exactly: NO_FAILURES
 """
 
@@ -84,16 +87,16 @@ Rules:
         gold_json: str,
     ) -> str:
         user_prompt = (
-            f"DOCUMENT (first 1500 chars):\n{document_text[:1500]}\n\n"
+            f"DOCUMENT (first 2000 chars):\n{document_text[:2000]}\n\n"
             f"PREDICTED JSON:\n{predicted_json}\n\n"
             f"GOLD STANDARD JSON:\n{gold_json}\n\n"
-            f"List all discrepancies."
+            "List all discrepancies using the specified format."
         )
         return self.call_llm(
             system_prompt=self._SYSTEM_PROMPT,
             user_prompt=user_prompt,
             role_name="Critic",
-            temperature=0.1,
+            temperature=0.0,
         )
 
 
@@ -107,25 +110,35 @@ class Mutator(BaseAgent):
 
     Strategy:
     1. Receives the current best prompt + a batch of structured critiques.
-    2. Maintains a memory of rejected prompts to avoid re-proposing failures.
-    3. Detects stalls (repeated patterns) and escalates to a bolder mutation.
-    4. Returns ONLY the new prompt text — no preamble, no explanation.
+    2. Maintains a rejection memory to avoid re-proposing previously failed variants.
+    3. Detects stalls (repeated no-improvement iterations) and escalates to bolder changes.
+    4. Returns ONLY the new prompt text — no preamble, no labels, no explanation.
     """
 
-    _SYSTEM_PROMPT = """You are a world-class prompt engineer specializing in structured JSON extraction.
+    _SYSTEM_PROMPT = """You are a world-class prompt engineer specialising in structured JSON extraction from documents.
 
-Your task: rewrite the given extraction prompt to fix all listed failure modes WITHOUT
-degrading performance on fields that currently work correctly.
+Your task: rewrite the given extraction prompt to fix every listed failure mode WITHOUT
+degrading performance on fields that currently extract correctly.
 
-Chain-of-thought process (internal only — do NOT include in output):
-1. Categorise each critique by failure type (missing, wrong value, format, etc.)
-2. Identify which prompt instructions are absent or unclear.
-3. Draft targeted rule additions or clarifications.
-4. Verify your new rules don't conflict with working parts of the current prompt.
-5. Write the final prompt.
+Internal reasoning process (do NOT include this in the output):
+1. Group each critique by failure type (missing field, wrong value, format error, type mismatch, etc.)
+2. Identify which instructions in the current prompt are absent, ambiguous, or contradicted.
+3. Draft targeted additions or clarifications for each failure group.
+4. Verify that new rules do not conflict with currently working extraction rules.
+5. Write the final, self-contained prompt.
 
-OUTPUT FORMAT: Return ONLY the final prompt text. No labels, no markdown, no explanation.
-The prompt must be self-contained — it will be sent directly to the extraction model.
+Key improvement strategies by failure type:
+- MISSING field     : Add an explicit extraction rule naming the exact field and describing where to find it.
+- WRONG_VALUE       : Add a clarification about which value to prefer (e.g. most recent, as written).
+- TYPE_MISMATCH     : Add an explicit type rule (e.g. "output years as integers, not strings").
+- HALLUCINATED      : Strengthen the "extract only from the document" prohibition.
+- FORMAT_ERROR      : Add a precise format example (e.g. "ISO 8601 date as YYYY-MM-DD").
+- ARRAY_MISMATCH    : Clarify ordering policy (most recent first) and completeness requirement.
+- NULL_WHEN_PRESENT : Stress that a field present in the document must never be null.
+
+OUTPUT FORMAT:
+Return ONLY the final prompt text — no labels, no markdown, no explanation.
+The prompt must be completely self-contained; it is sent directly to the extraction model.
 """
 
     def mutate(
@@ -144,7 +157,7 @@ The prompt must be self-contained — it will be sent directly to the extraction
         critiques       : List of Critic outputs from failed documents.
         rejected_prompts: Prompts already tried and rejected (last 5 shown).
         stall_count     : Consecutive iterations with no improvement.
-                          If ≥ 3, instructs the mutator to try a bolder change.
+                          If >= 3, the mutator is instructed to try a bolder change.
         """
         critique_block = "\n\n---\n\n".join(
             f"Critique {i + 1}:\n{c}" for i, c in enumerate(critiques)
@@ -154,16 +167,20 @@ The prompt must be self-contained — it will be sent directly to the extraction
         if rejected_prompts:
             recent = rejected_prompts[-5:]
             rejection_block = (
-                "\n\nREJECTED PROMPTS (do NOT re-propose these — they scored worse):\n"
-                + "\n\n".join(f"[REJECTED {i+1}]:\n{p}" for i, p in enumerate(recent))
+                "\n\nREJECTED PROMPTS — do NOT reproduce these variants (they scored worse):\n"
+                + "\n\n".join(
+                    f"[REJECTED {i + 1}]:\n{p}" for i, p in enumerate(recent)
+                )
             )
 
         stall_note = ""
         if stall_count >= 3:
             stall_note = (
-                f"\n\n⚠️  STALL DETECTED: The score has not improved for {stall_count} "
-                f"consecutive iterations. Try a significantly different structure, "
-                f"add concrete field-by-field extraction rules, or include a worked example."
+                f"\n\n⚠️  STALL ALERT: The validation score has not improved for "
+                f"{stall_count} consecutive iterations. The incremental approach is not "
+                "working. Try a significantly different strategy: restructure the field rules, "
+                "add a concrete worked extraction example, or decompose a complex field into "
+                "explicit sub-steps."
             )
 
         user_prompt = (
@@ -171,12 +188,12 @@ The prompt must be self-contained — it will be sent directly to the extraction
             f"FAILURE CRITIQUES FROM VALIDATION SET:\n{critique_block}"
             f"{rejection_block}"
             f"{stall_note}\n\n"
-            f"Write the improved prompt now."
+            "Write the improved prompt now."
         )
 
         return self.call_llm(
             system_prompt=self._SYSTEM_PROMPT,
             user_prompt=user_prompt,
             role_name="Mutator",
-            temperature=0.4,  # Some creativity for mutation
+            temperature=0.4,
         )

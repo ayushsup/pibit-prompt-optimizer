@@ -1,64 +1,247 @@
-# 🚀 Pibit.ai Prompt Optimizer: Automated Critic-Mutator Framework
+# Pibit.ai Prompt Optimizer: Automated Critic-Mutator Framework
 
-[cite_start]A production-grade, highly modular multi-agent pipeline designed to automatically optimize Large Language Model (LLM) prompts for highly structured JSON extraction from complex documents[cite: 5]. [cite_start]This system leverages a decoupled scoring engine [cite: 42][cite_start], deterministic dataset evaluation [cite: 31, 32][cite_start], and a resilient Critic-Mutator architecture to systematically debug, iterate, and improve prompt efficiency within strict budget caps[cite: 12, 47].
+A modular, multi-agent pipeline for automatically optimising LLM prompts for structured JSON extraction from documents. Built for the [ExtractBench](https://github.com/ContextualAI/extract-bench) benchmark.
 
-[cite_start]Designed natively to target the **ExtractBench** benchmark suites [cite: 22][cite_start], the framework operates entirely via configurations—requiring zero code alterations to retarget new underlying datasets, models, or evaluation schemas[cite: 54, 55, 68].
-
----
-
-## 🛠️ System Architecture
-
-[cite_start]Unlike primitive "random mutation" greedy loops [cite: 4][cite_start], this platform utilizes a **Multi-Role Agentic Strategy** to emulate standard software debugging lifecycles[cite: 17]:
-
-1. [cite_start]**The Extractor:** Processes raw PDF source texts using the current operational prompt variant to output structured JSON matching the exact targeted schema[cite: 22, 29, 30].
-2. **The Critic:** Intercepts runtime failures, performing a deep-dive diff between faulty extractions and ground-truth annotations to isolate exact semantic or structured failure modes.
-3. [cite_start]**The Mutator:** Acts as an automated prompt engineer, ingesting historical critiques to refactor prompt rules dynamically, avoiding regressions while aggressively climbing the score curve[cite: 70].
+> **Video walkthrough:** _[Link to be added after recording]_
 
 ---
 
-## ⚙️ Project Structure
+## System Architecture
 
-```text
+The optimizer implements a **Greedy Accept/Reject loop** with three LLM roles:
+
+```
+┌────────────────────────────────────────────────────────────┐
+│                    Optimization Loop                        │
+│                                                            │
+│   ┌──────────┐    JSON     ┌─────────┐   Critique  ┌─────┐│
+│   │ Extractor│ ──────────► │  Scorer │ ──────────► │Crit-││
+│   │(current  │             │(F1, P/R)│             │ic   ││
+│   │ prompt)  │             └─────────┘             └──┬──┘│
+│   └──────────┘                                        │   │
+│        ▲                                         ┌────▼──┐│
+│        │ new prompt                              │Mutator││
+│        └────────────────────────────────────────└───────┘│
+└────────────────────────────────────────────────────────────┘
+```
+
+| Component | Role |
+|-----------|------|
+| **Extractor** | Applies the current prompt to a document and returns structured JSON |
+| **Critic** | Compares predicted JSON to gold standard, producing field-level failure diagnoses |
+| **Mutator** | Synthesises critiques into an improved prompt, avoiding previously rejected variants |
+| **Scorer** | Schema-aware recursive F1 scorer — fully independent of the optimization loop |
+| **StateManager** | SQLite-backed persistence for all LLM calls, scores, and trajectory |
+
+---
+
+## Project Structure
+
+```
 pibit-prompt-optimizer/
 ├── config/
-│   ├── base_config.yaml         # Production optimization configuration
-│   └── test_config.yaml         # Fast-cycle framework validation config
+│   ├── base_config.yaml         # Production run configuration
+│   └── test_config.yaml         # Fast 3-iteration smoke-test config
 ├── data/
-│   └── extract-bench/           # ExtractBench benchmarking data
+│   └── extract-bench/           # ExtractBench dataset (cloned separately)
 ├── src/
-│   ├── __init__.py
-│   ├── core/
-│   │   ├── config_parser.py     # Pydantic configuration validation layer
-│   │   └── state_manager.py     # SQLite persistence engine & log tracing
-│   ├── data/
-│   │   ├── loader.py            # PDF text extraction and schema maps
-│   │   └── splitter.py          # Seeded deterministic dataset partitioning
-│   ├── evaluation/
-│   │   ├── metrics.py           # Evaluation primitives (exact match, tolerances)
-│   │   └── scorer.py            # Precision, Recall, F1 aggregation tree
 │   ├── agents/
-│   │   ├── extractor.py         # Handles target extraction interactions
-│   │   ├── critic.py            # Analyzes failure edge-cases against gold data
-│   │   └── mutator.py           # Proposes strategic, non-regressive mutations
+│   │   ├── base_agent.py        # LLM client with retry, backoff, daily-limit detection
+│   │   └── critic_mutator.py    # Extractor, Critic, Mutator implementations
+│   ├── core/
+│   │   ├── config_parser.py     # Pydantic configuration validation
+│   │   └── state_manager.py     # SQLite persistence: logs, trajectory, metric cache
+│   ├── data/
+│   │   ├── loader.py            # Multi-stage PDF extraction + vision OCR fallback
+│   │   └── splitter.py          # Seeded deterministic train/val/test split
+│   ├── evaluation/
+│   │   ├── metrics.py           # string_exact, integer_exact, number_tolerance,
+│   │   │                        # boolean_exact, string_semantic, array_llm
+│   │   └── scorer.py            # Schema-aware recursive P/R/F1 scorer
 │   └── optimizer/
-│       ├── loop.py              # Central budget-enforced execution engine
-│       └── diff_viewer.py       # Automated Git-style prompt diff logging
+│       ├── loop.py              # Central optimization engine + REPORT.md generation
+│       └── diff_viewer.py       # Unified diff logging for accepted mutations
 ├── tests/
-│   └── test_scorer.py           # Unit tests for scoring configurations
-├── requirements.txt             # Project environment dependencies
-└── run.py                       # Single command pipeline entry point
+│   └── test_scorer.py           # Scorer unit tests (run with pytest)
+├── logs/
+│   └── diffs/                   # Per-iteration prompt diffs (auto-generated)
+├── run_state.db                 # SQLite run state (auto-generated)
+├── REPORT.md                    # Final report (auto-generated after run)
+├── requirements.txt
+└── run.py                       # Entry point
+```
 
-🚀 Step-by-Step Setup1. Environment PreparationClone this repository and establish your local Python environment:Bashgit clone [https://github.com/your-username/pibit-prompt-optimizer.git](https://github.com/your-username/pibit-prompt-optimizer.git)
+---
+
+## Setup
+
+### 1. Clone and install dependencies
+
+```bash
+git clone https://github.com/your-username/pibit-prompt-optimizer.git
 cd pibit-prompt-optimizer
 pip install -r requirements.txt
-2. Dataset InitializationSecure the ExtractBench benchmark data locally:  Bashgit clone [https://github.com/ContextualAI/extract-bench.git](https://github.com/ContextualAI/extract-bench.git) data/extract-bench
-3. API Key DeploymentExport your Gemini API Key into your current terminal runtime to leverage the high-performance, zero-cost Gemini Free Tier:Linux/macOS:Bashexport GEMINI_API_KEY="your_free_ai_studio_api_key"
-Windows (CMD):DOSset GEMINI_API_KEY=your_free_ai_studio_api_key
-📈 Running the SystemExecutionRun the full optimization pipeline using the production configuration:  Bashpython run.py
-Fault Tolerance & State RecoveryCrash Resilience: Every LLM call, input/output token count, latency value, and trajectory scoring step is instantly persisted to a local SQLite database (run_state.db).  Graceful Resumption: If an external interruption occurs (e.g., system termination, temporary connection issues), the runtime loop safely picks up right from its last valid persisted checkpoint without data or iteration loss.  🔄 Configuration-Driven Dataset RetargetingThe core optimization framework remains fully decoupled from the evaluation data. To switch testing scopes from hiring/resume to finance/10kq or any custom bundle, you do not modify the source code.  Simply edit the config/base_config.yaml dataset entry:  YAMLdataset:
-  name: "finance/10kq"             # Retargets schema path seamlessly
+```
+
+### 2. Clone the ExtractBench dataset
+
+```bash
+git clone https://github.com/ContextualAI/extract-bench.git data/extract-bench
+```
+
+### 3. Set your API key
+
+The system uses **OpenRouter** to access LLM models (including free-tier models).
+
+```bash
+# Linux / macOS
+export OPENROUTER_API_KEY="your_openrouter_api_key"
+
+# Windows (CMD)
+set OPENROUTER_API_KEY=your_openrouter_api_key
+```
+
+**Optional — for scanned PDF OCR via Google Gemini:**
+
+```bash
+export GEMINI_API_KEY="your_gemini_api_key"
+```
+
+If `GEMINI_API_KEY` is not set, the system uses the `vision_model` from config
+(a vision-capable model on OpenRouter) as the OCR fallback for scanned PDFs.
+
+---
+
+## Running
+
+### Full optimization run
+
+```bash
+python run.py
+```
+
+This will:
+1. Load the dataset specified in `config/base_config.yaml`
+2. Run up to `max_iterations` of Extract → Score → Critique → Mutate
+3. Evaluate the best prompt on the held-out test set
+4. Write `REPORT.md` with full results
+
+### Resume an interrupted run
+
+Simply re-run `python run.py`. The optimizer reads `run_state.db` and
+continues from the last completed iteration automatically.
+
+### Fast smoke-test (3 iterations)
+
+```bash
+python -c "from src.optimizer.loop import OptimizerLoop; OptimizerLoop('config/test_config.yaml').run()"
+```
+
+### Run scorer unit tests
+
+```bash
+pytest tests/test_scorer.py -v
+```
+
+---
+
+## Retargeting to a Different Dataset
+
+To switch from `hiring/resume` to any other ExtractBench schema, edit only
+`config/base_config.yaml` — no code changes required:
+
+```yaml
+dataset:
+  name: "finance/10kq"            # Options: academic/research, finance/10kq,
+                                   #          finance/credit_agreement, sport/swimming
   base_path: "./data/extract-bench"
-  split_seed: 42                   # Keeps data splits perfectly reproducible
+  split_seed: 42
   train_ratio: 0.6
   val_ratio: 0.2
-🔍 Observability & Evaluation TestingPrompt Diff Inspections: The system builds automatic markdown diff views inside logs/diffs/ following every successful mutation step, allowing human operators to audit prompt iteration logic directly.  Scoring Integrity Tests: Run the explicit evaluation suite to guarantee mathematical correctness across the per-field matching heuristics:  Bashpytest tests/test_scorer.py
+```
+
+Also update the `seed_prompt` in the config to describe the new document type.
+The optimization logic, scoring function, and all agents remain untouched.
+
+---
+
+## Split Policy
+
+Documents are shuffled using Python's `random.Random` seeded with `split_seed`
+(default `42`), then sliced sequentially:
+
+| Split | Fraction | Purpose |
+|-------|----------|---------|
+| Train | `train_ratio` | Available for future few-shot selection (loaded but not yet used in the greedy loop) |
+| Val | `val_ratio` | Optimization objective — prompt is accepted/rejected based on this score |
+| Test | remainder | Held-out; evaluated exactly **once** after the loop completes |
+
+For small datasets (< 3 documents), the splitter redistributes to guarantee
+at least 1 document each in val and test, with a printed warning.
+
+---
+
+## Scoring
+
+The scorer traverses the JSON Schema alongside the predicted and gold JSON
+objects, computing **micro-averaged precision, recall, and F1** across all
+leaf fields. Per-field evaluation policies are honoured exactly as specified:
+
+| Policy | Description |
+|--------|-------------|
+| `string_exact` | Case-insensitive, whitespace-stripped exact match |
+| `integer_exact` | Exact integer match with numeric type coercion |
+| `number_tolerance` | Numeric match within 5% relative tolerance |
+| `boolean_exact` | Exact boolean match with coercion from strings/ints |
+| `string_semantic` | LLM judge (cached per pred/gold pair) |
+| `array_llm` | LLM judge for array equivalence (cached) |
+
+**Array alignment policy:**
+- *Arrays of objects:* Positional (index-based) alignment
+- *Arrays of primitives:* Set-based soft F1
+
+**anyOf fields:** Resolved by matching the gold value's actual Python type
+to the appropriate schema variant, then scoring with the matched variant.
+
+Stochastic metric results (`string_semantic`, `array_llm`) are cached in
+`run_state.db` keyed by SHA-256 hash of `(metric, pred, gold)`, ensuring
+deterministic replay across runs.
+
+---
+
+## Observability
+
+| Artefact | Location | Contents |
+|----------|----------|----------|
+| LLM call log | `run_state.db` → `llm_logs` | Input, output, tokens, latency, cost per call |
+| Optimization trajectory | `run_state.db` → `optimization_trajectory` | Prompt, val F1, accepted/rejected per iteration |
+| Metric cache | `run_state.db` → `metric_cache` | Cached stochastic judge scores |
+| Prompt diffs | `logs/diffs/diff_iteration_N.diff` | Unified diff between successive accepted prompts |
+| Final report | `REPORT.md` | Seed vs final scores, subtree breakdown, trajectory, limitations |
+
+---
+
+## Configuration Reference
+
+```yaml
+dataset:
+  name: "hiring/resume"          # <category>/<schema> matching extract-bench folder
+  base_path: "./data/extract-bench"
+  split_seed: 42                 # RNG seed for reproducible splits
+  train_ratio: 0.5               # Fraction for training split
+  val_ratio: 0.2                 # Fraction for validation split
+
+budget:
+  max_iterations: 20             # Hard cap on optimization iterations
+  max_cost_dollars: 0.0          # Dollar budget (0 = unlimited / free tier)
+
+vision_model: "google/gemini-2.0-flash-exp:free"  # OCR fallback for scanned PDFs
+
+models:
+  extractor: "poolside/laguna-xs.2:free"
+  critic:    "poolside/laguna-xs.2:free"
+  mutator:   "poolside/laguna-xs.2:free"
+
+seed_prompt: |
+  <your extraction prompt here>
+```

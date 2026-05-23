@@ -4,6 +4,14 @@ Base LLM agent with resilient retry logic, latency tracking, and state logging.
 All agents inherit from BaseAgent. It connects to OpenRouter's OpenAI-compatible
 API endpoint, handles rate limits (429), server errors (5xx) via exponential
 backoff, and logs every call to the SQLite StateManager.
+
+Daily limit detection
+---------------------
+OpenRouter free-tier models have both a per-minute rate limit and a daily
+request cap. When the daily cap is hit, the 429 response body contains
+"free-models-per-day". This module detects that case and raises immediately
+(rather than waiting through all retries) so the optimizer can shut down
+cleanly and resume tomorrow from its persisted state.
 """
 
 import os
@@ -13,20 +21,25 @@ from openai import OpenAI
 from src.core.state_manager import StateManager
 
 
+class DailyLimitError(Exception):
+    """Raised when the OpenRouter free daily request quota is exhausted."""
+
+
 class BaseAgent:
     """
     Shared LLM client used by Extractor, Critic, and Mutator.
 
     Retry strategy:
-      - 429 (Rate Limit)  : exponential backoff starting at 15 s
-      - 5xx (Server Error): fixed 20 s pause
+      - daily limit (429 + "free-models-per-day") : raise DailyLimitError immediately
+      - 429 (Rate Limit)  : exponential backoff starting at 10 s
+      - 5xx (Server Error): fixed 15 s pause
       - Other exceptions  : re-raised immediately after logging
     """
 
     MAX_RETRIES = 5
-    BASE_DELAY_429 = 15   # seconds; doubles each attempt
-    DELAY_5XX = 20        # seconds; fixed
-    INTER_CALL_PAUSE = 8  # seconds; polite pause between successful calls
+    BASE_DELAY_429 = 10   # seconds; doubles each attempt
+    DELAY_5XX = 15        # seconds; fixed
+    INTER_CALL_PAUSE = 3  # seconds; polite pause between successful calls
 
     def __init__(self, model_name: str, state_manager: StateManager):
         api_key = os.environ.get("OPENROUTER_API_KEY")
@@ -61,6 +74,11 @@ class BaseAgent:
         role_name     : Label used in logs (e.g. "Extractor", "Critic").
         temperature   : Sampling temperature; lower = more deterministic.
         max_tokens    : Hard cap on response length.
+
+        Raises
+        ------
+        DailyLimitError  : When the free daily quota is exhausted.
+        Exception        : After MAX_RETRIES failed attempts.
         """
         last_exception = None
 
@@ -85,7 +103,7 @@ class BaseAgent:
                     response=content,
                     model=self.model_name,
                     usage=response.usage.model_dump() if response.usage else {},
-                    cost=0.0,  # OpenRouter free tier
+                    cost=0.0,
                     latency_ms=latency_ms,
                 )
 
@@ -96,19 +114,37 @@ class BaseAgent:
                 last_exception = exc
                 error_msg = str(exc)
 
-                if attempt >= self.MAX_RETRIES - 1:
-                    print(f"❌ [{role_name}] Max retries ({self.MAX_RETRIES}) reached. Failing.")
-                    raise exc
-
                 if "429" in error_msg:
+                    # Detect daily quota exhaustion — no point retrying
+                    if "free-models-per-day" in error_msg or "per-day" in error_msg:
+                        print(
+                            f"\n🚫 [{role_name}] Daily free-model quota exhausted. "
+                            "State is persisted — re-run tomorrow to resume."
+                        )
+                        raise DailyLimitError(error_msg) from exc
+
+                    if attempt >= self.MAX_RETRIES - 1:
+                        print(f"❌ [{role_name}] Max retries ({self.MAX_RETRIES}) reached. Failing.")
+                        raise exc
+
                     delay = self.BASE_DELAY_429 * (2 ** attempt)
-                    print(f"⚠️  [{role_name}] Rate-limited (429). Retrying in {delay}s "
-                          f"(attempt {attempt + 1}/{self.MAX_RETRIES})…")
+                    print(
+                        f"⚠️  [{role_name}] Rate-limited (429). Retrying in {delay}s "
+                        f"(attempt {attempt + 1}/{self.MAX_RETRIES})…"
+                    )
                     time.sleep(delay)
+
                 elif any(code in error_msg for code in ("500", "502", "503")):
-                    print(f"⚠️  [{role_name}] Server error. Retrying in {self.DELAY_5XX}s "
-                          f"(attempt {attempt + 1}/{self.MAX_RETRIES})…")
+                    if attempt >= self.MAX_RETRIES - 1:
+                        print(f"❌ [{role_name}] Max retries ({self.MAX_RETRIES}) reached. Failing.")
+                        raise exc
+
+                    print(
+                        f"⚠️  [{role_name}] Server error. Retrying in {self.DELAY_5XX}s "
+                        f"(attempt {attempt + 1}/{self.MAX_RETRIES})…"
+                    )
                     time.sleep(self.DELAY_5XX)
+
                 else:
                     raise exc  # Non-retryable error
 

@@ -2,10 +2,13 @@
 Unit tests for the scoring subsystem.
 
 Covers:
-  - All five evaluation metric types (string_exact, integer_exact,
-    number_tolerance, string_semantic, array_llm)
+  - All six evaluation metric types (string_exact, integer_exact,
+    number_tolerance, boolean_exact, string_semantic, array_llm)
   - ScoreResult accumulation and F1 arithmetic
   - Scorer.score_document on synthetic schema+gold+pred triples
+  - ExtractBench schema_definition envelope unwrapping
+  - anyOf field handling (nullable fields, polymorphic types)
+  - additionalProperties object handling (grouped skills)
   - Array alignment policy (positional for objects, set-based for primitives)
   - Graceful handling of malformed predictions (empty JSON, parse errors)
   - Scorer.calculate_f1 edge cases (zero division)
@@ -17,6 +20,7 @@ import json
 import pytest
 
 from src.evaluation.metrics import (
+    boolean_exact,
     integer_exact,
     number_tolerance,
     string_exact,
@@ -93,6 +97,35 @@ class TestNumberTolerance:
         assert number_tolerance("invalid", 100) == 0.0
 
 
+class TestBooleanExact:
+    def test_true_true(self):
+        assert boolean_exact(True, True) == 1.0
+
+    def test_false_false(self):
+        assert boolean_exact(False, False) == 1.0
+
+    def test_true_false(self):
+        assert boolean_exact(True, False) == 0.0
+
+    def test_string_true(self):
+        assert boolean_exact("true", True) == 1.0
+
+    def test_string_false(self):
+        assert boolean_exact("false", False) == 1.0
+
+    def test_integer_1(self):
+        assert boolean_exact(1, True) == 1.0
+
+    def test_integer_0(self):
+        assert boolean_exact(0, False) == 1.0
+
+    def test_mismatch_string(self):
+        assert boolean_exact("false", True) == 0.0
+
+    def test_none_pred(self):
+        assert boolean_exact(None, True) == 0.0
+
+
 # ---------------------------------------------------------------------------
 # Cache key test
 # ---------------------------------------------------------------------------
@@ -133,7 +166,6 @@ class TestScoreResult:
 
     def test_f1_formula(self):
         r = ScoreResult(true_positives=2.0, predicted_count=4, gold_count=4)
-        # P=0.5, R=0.5, F1=0.5
         assert abs(r.f1 - 0.5) < 1e-6
 
     def test_merge(self):
@@ -178,7 +210,7 @@ class TestScorerF1:
 
 
 # ---------------------------------------------------------------------------
-# Scorer.score_document integration tests
+# Scorer.score_document — basic schema
 # ---------------------------------------------------------------------------
 
 SCHEMA_SIMPLE = json.dumps({
@@ -188,6 +220,7 @@ SCHEMA_SIMPLE = json.dumps({
         "age":  {"type": "integer", "evaluation_config": "integer_exact"},
     }
 })
+
 
 class TestScorerDocument:
     def setup_method(self):
@@ -207,14 +240,14 @@ class TestScorerDocument:
 
     def test_missing_field(self):
         gold = json.dumps({"name": "Alice", "age": 30})
-        pred = json.dumps({"name": "Alice"})  # age absent
+        pred = json.dumps({"name": "Alice"})
         f1, _ = self.scorer.score_document(pred, gold, SCHEMA_SIMPLE)
         assert f1 < 1.0
 
     def test_malformed_prediction(self):
         gold = json.dumps({"name": "Alice", "age": 30})
         f1, breakdown = self.scorer.score_document("not-json", gold, SCHEMA_SIMPLE)
-        assert f1 == 0.0  # graceful failure
+        assert f1 == 0.0
 
     def test_json_with_fences(self):
         gold = json.dumps({"name": "Alice", "age": 30})
@@ -231,7 +264,174 @@ class TestScorerDocument:
 
 
 # ---------------------------------------------------------------------------
-# Array alignment policy tests
+# schema_definition envelope unwrapping (ExtractBench format)
+# ---------------------------------------------------------------------------
+
+SCHEMA_WRAPPED = json.dumps({
+    "name": "Test Schema",
+    "description": "A schema with the ExtractBench envelope",
+    "schema_definition": {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string", "evaluation_config": "string_exact"},
+            "year":  {"type": "integer", "evaluation_config": "integer_exact"},
+        }
+    }
+})
+
+
+class TestSchemaEnvelopeUnwrapping:
+    def setup_method(self):
+        self.scorer = Scorer()
+
+    def test_wrapped_schema_scores_correctly(self):
+        gold = json.dumps({"title": "My Paper", "year": 2024})
+        pred = json.dumps({"title": "My Paper", "year": 2024})
+        f1, _ = self.scorer.score_document(pred, gold, SCHEMA_WRAPPED)
+        assert f1 == 1.0
+
+    def test_wrapped_schema_partial(self):
+        gold = json.dumps({"title": "My Paper", "year": 2024})
+        pred = json.dumps({"title": "My Paper", "year": 2023})
+        f1, _ = self.scorer.score_document(pred, gold, SCHEMA_WRAPPED)
+        assert 0.0 < f1 < 1.0
+
+    def test_wrapped_schema_missing_field(self):
+        gold = json.dumps({"title": "My Paper", "year": 2024})
+        pred = json.dumps({"title": "My Paper"})
+        f1, _ = self.scorer.score_document(pred, gold, SCHEMA_WRAPPED)
+        assert f1 < 1.0
+
+    def test_wrapped_schema_does_not_return_zero_for_perfect_pred(self):
+        """Regression: before the fix, wrapped schemas always returned F1=0."""
+        gold = json.dumps({"title": "Test", "year": 2020})
+        pred = json.dumps({"title": "Test", "year": 2020})
+        f1, _ = self.scorer.score_document(pred, gold, SCHEMA_WRAPPED)
+        assert f1 > 0.0
+
+
+# ---------------------------------------------------------------------------
+# anyOf field handling
+# ---------------------------------------------------------------------------
+
+SCHEMA_ANY_OF = json.dumps({
+    "type": "object",
+    "properties": {
+        "startDate": {
+            "anyOf": [
+                {"type": "string",  "evaluation_config": "string_exact"},
+                {"type": "integer", "evaluation_config": "integer_exact"},
+                {"type": "null"},
+            ]
+        },
+        "isCurrent": {
+            "anyOf": [
+                {"type": "boolean", "evaluation_config": "boolean_exact"},
+                {"type": "null"},
+            ]
+        },
+    }
+})
+
+
+class TestAnyOf:
+    def setup_method(self):
+        self.scorer = Scorer()
+
+    def test_any_of_integer_match(self):
+        gold = json.dumps({"startDate": 2020, "isCurrent": False})
+        pred = json.dumps({"startDate": 2020, "isCurrent": False})
+        f1, _ = self.scorer.score_document(pred, gold, SCHEMA_ANY_OF)
+        assert f1 == 1.0
+
+    def test_any_of_string_match(self):
+        gold = json.dumps({"startDate": "Spring 2020", "isCurrent": True})
+        pred = json.dumps({"startDate": "Spring 2020", "isCurrent": True})
+        f1, _ = self.scorer.score_document(pred, gold, SCHEMA_ANY_OF)
+        assert f1 == 1.0
+
+    def test_any_of_null_gold_not_counted(self):
+        """Null gold values should contribute 0 to gold_count."""
+        gold = json.dumps({"startDate": None, "isCurrent": True})
+        pred = json.dumps({"startDate": "something", "isCurrent": True})
+        f1, breakdown = self.scorer.score_document(pred, gold, SCHEMA_ANY_OF)
+        # isCurrent should still score perfectly
+        assert f1 > 0.0
+
+    def test_any_of_wrong_value(self):
+        gold = json.dumps({"startDate": 2020, "isCurrent": True})
+        pred = json.dumps({"startDate": 2019, "isCurrent": True})
+        f1, _ = self.scorer.score_document(pred, gold, SCHEMA_ANY_OF)
+        assert f1 < 1.0
+
+    def test_any_of_missing_pred(self):
+        gold = json.dumps({"startDate": 2020, "isCurrent": True})
+        pred = json.dumps({"startDate": None, "isCurrent": True})
+        f1, _ = self.scorer.score_document(pred, gold, SCHEMA_ANY_OF)
+        assert f1 < 1.0
+
+
+# ---------------------------------------------------------------------------
+# additionalProperties (grouped skills object)
+# ---------------------------------------------------------------------------
+
+SCHEMA_ADDITIONAL_PROPS = json.dumps({
+    "type": "object",
+    "properties": {
+        "skills": {
+            "anyOf": [
+                {
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "array",
+                        "evaluation_config": "string_exact",
+                        "items": {"type": "string", "evaluation_config": "string_exact"},
+                    }
+                },
+                {
+                    "type": "array",
+                    "evaluation_config": "string_exact",
+                    "items": {"type": "string", "evaluation_config": "string_exact"},
+                },
+                {"type": "null"},
+            ]
+        }
+    }
+})
+
+
+class TestAdditionalProperties:
+    def setup_method(self):
+        self.scorer = Scorer()
+
+    def test_grouped_skills_perfect(self):
+        gold = json.dumps({"skills": {"Technical": ["Python", "SQL"], "Soft": ["Communication"]}})
+        pred = json.dumps({"skills": {"Technical": ["Python", "SQL"], "Soft": ["Communication"]}})
+        f1, _ = self.scorer.score_document(pred, gold, SCHEMA_ADDITIONAL_PROPS)
+        assert f1 == 1.0
+
+    def test_grouped_skills_partial(self):
+        gold = json.dumps({"skills": {"Technical": ["Python", "SQL", "Java"]}})
+        pred = json.dumps({"skills": {"Technical": ["Python", "SQL"]}})
+        f1, _ = self.scorer.score_document(pred, gold, SCHEMA_ADDITIONAL_PROPS)
+        assert 0.0 < f1 < 1.0
+
+    def test_flat_skills_perfect(self):
+        gold = json.dumps({"skills": ["Python", "SQL"]})
+        pred = json.dumps({"skills": ["Python", "SQL"]})
+        f1, _ = self.scorer.score_document(pred, gold, SCHEMA_ADDITIONAL_PROPS)
+        assert f1 == 1.0
+
+    def test_null_skills(self):
+        gold = json.dumps({"skills": None})
+        pred = json.dumps({"skills": None})
+        f1, _ = self.scorer.score_document(pred, gold, SCHEMA_ADDITIONAL_PROPS)
+        # Null gold → nothing to score → no penalty
+        assert f1 == 0.0  # no gold fields → F1 undefined → 0
+
+
+# ---------------------------------------------------------------------------
+# Array alignment policy
 # ---------------------------------------------------------------------------
 
 SCHEMA_ARRAY_STR = json.dumps({
@@ -260,6 +460,7 @@ SCHEMA_ARRAY_OBJ = json.dumps({
         }
     }
 })
+
 
 class TestArrayAlignment:
     def setup_method(self):
@@ -296,12 +497,8 @@ class TestArrayAlignment:
         assert f1 == 1.0
 
     def test_object_array_partial_positional(self):
-        gold = json.dumps({"jobs": [
-            {"company": "Acme", "title": "Engineer"},
-        ]})
-        pred = json.dumps({"jobs": [
-            {"company": "Wrong Corp", "title": "Engineer"},
-        ]})
+        gold = json.dumps({"jobs": [{"company": "Acme", "title": "Engineer"}]})
+        pred = json.dumps({"jobs": [{"company": "Wrong Corp", "title": "Engineer"}]})
         f1, _ = self.scorer.score_document(pred, gold, SCHEMA_ARRAY_OBJ)
         assert 0.0 < f1 < 1.0
 
@@ -318,8 +515,7 @@ class TestArrayAlignment:
 
 class TestStochasticFallback:
     def setup_method(self):
-        # No judge_callable → falls back to string_exact
-        self.scorer = Scorer()
+        self.scorer = Scorer()  # No judge_callable → falls back to string_exact
 
     def test_string_semantic_fallback_match(self):
         score = self.scorer._evaluate_with_config("hello", "hello", "string_semantic")
@@ -328,3 +524,26 @@ class TestStochasticFallback:
     def test_string_semantic_fallback_mismatch(self):
         score = self.scorer._evaluate_with_config("hello", "world", "string_semantic")
         assert score == 0.0
+
+
+# ---------------------------------------------------------------------------
+# JSON fence stripping
+# ---------------------------------------------------------------------------
+
+class TestCleanJson:
+    def setup_method(self):
+        self.scorer = Scorer()
+
+    def test_strips_json_fence(self):
+        raw = "```json\n{\"key\": \"value\"}\n```"
+        cleaned = self.scorer._clean_json(raw)
+        assert cleaned == '{"key": "value"}'
+
+    def test_strips_plain_fence(self):
+        raw = "```\n{\"key\": 1}\n```"
+        cleaned = self.scorer._clean_json(raw)
+        assert cleaned == '{"key": 1}'
+
+    def test_no_fence_passthrough(self):
+        raw = '{"key": "value"}'
+        assert self.scorer._clean_json(raw) == raw
