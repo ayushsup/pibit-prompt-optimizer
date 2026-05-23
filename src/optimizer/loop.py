@@ -62,13 +62,13 @@ class OptimizerLoop:
 
         # ---- Dataset loading ----
         # Use os.path.join so paths work on both Windows and Unix
-        vision_model = getattr(cfg, "vision_model", "google/gemini-2.0-flash-exp:free")
+        # ---- Dataset loading ----
+        # Use os.path.join so paths work on both Windows and Unix
         dataset_base = os.path.join(cfg.dataset.base_path, "dataset")
 
         loader = ExtractBenchLoader(
             base_path=dataset_base,
-            schema_name=cfg.dataset.name,
-            vision_model=vision_model,
+            schema_name=cfg.dataset.name
         )
         print(f"\n📂 Loading dataset: {cfg.dataset.name}")
         all_docs = loader.load_all_document_pairs()

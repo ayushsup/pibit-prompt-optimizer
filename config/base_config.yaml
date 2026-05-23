@@ -11,7 +11,7 @@ budget:
 
 # vision_model is used as an OCR fallback for scanned/image-based PDFs.
 # Must be a vision-capable model available on OpenRouter.
-vision_model: "google/gemini-2.0-flash-exp:free"
+vision_model: "poolside/laguna-m.1:free"
 
 models:
   extractor: "poolside/laguna-xs.2:free"
