@@ -1,20 +1,21 @@
             # Prompt Optimization Report
 
-            **Generated:** 2026-05-23 23:33:32
-            **Dataset:** `hiring/resume`
-            **Models:** extractor=`poolside/laguna-xs.2:free`  critic=`poolside/laguna-xs.2:free`  mutator=`poolside/laguna-xs.2:free`
+            **Generated:** 2026-05-24 19:35:43  
+            **Dataset:** `hiring/resume`  
+            **Models:** extractor=`poolside/laguna-xs.2:free`  
+            critic=`poolside/laguna-xs.2:free`  mutator=`poolside/laguna-xs.2:free`
 
             ---
 
             ## 1. Test-Set Scores
 
-            | Prompt  | Test F1 |
-            |---------|---------|
-            | Seed    | 0.0000 |
-            | Final   | 0.0000 |
-            | **Δ**   | **+0.0000** |
+            | Prompt | Test F1 |
+            |--------|---------|
+            | Seed   | 0.0000 |
+            | Final  | 0.0000 |
+            | **Δ**  | **+0.0000** |
 
-            Best validation F1 achieved: **0.0000**
+            Best validation F1 achieved during optimization: **0.0000**
 
             ---
 
@@ -36,7 +37,7 @@
 
             ## 4. Notable Accepted Mutations
 
-            - No mutations improved over the seed.
+            - No mutations improved over the seed during this run.
 
             ---
 
@@ -71,44 +72,39 @@ FIELD-BY-FIELD EXTRACTION RULES:
 
 3. education (array of objects):
    - institution: exact institution name as written
-   - qualificationTitle: full degree or qualification title (e.g. "PhD in Computer Science",
-                         "Master of Business Administration")
-   - startDate: integer year or string, same rules as workExperience; null if not stated
+   - qualificationTitle: full degree or qualification title (e.g. "PhD in Computer Science")
+   - startDate: integer year or string; null if not stated
    - endDate: integer year or string; null if not yet completed or not stated
    - description: GPA, honours, thesis title, mentors, relevant coursework; null if none
 
 4. skills:
-   - If the document organises skills under category headings (e.g. "Technical Skills",
-     "Research Interests", "Marketing Platforms"): output an object where each key is a
+   - If skills are organised under category headings: output an object where each key is a
      category name and each value is an array of skill strings under that heading
    - If skills are listed without categories (flat list): output an array of skill strings
    - Output null if no skills section is present in the document
 
-5. socialLinks: array of all URLs found in the document (LinkedIn, GitHub, personal website,
-   ORCID, ResearchGate, etc.); output [] if none present
+5. socialLinks: array of all URLs found (LinkedIn, GitHub, ORCID, personal website, etc.); [] if none
 
 6. certificationsAndAwards (array of objects):
-   - description: the name or title of the certification, award, membership, or honor
-   - organization: the granting or issuing organisation
-   - date: the date awarded or obtained; null if not stated
+   - description: the name or title of the certification, award, or honour
+   - organization: the granting organisation
+   - date: the date awarded; null if not stated
    - category: one of "Certification", "Award", "Membership", "Honor", "License", or "Affiliation"
 
-7. publications: array of publication citation strings exactly as listed in the document;
-   output [] if no publications section is present
+7. publications: array of citation strings exactly as listed; [] if no publications section
 
-8. media: array of strings describing media appearances, press mentions, or interviews;
-   output [] if none present
+8. media: array of strings describing media appearances or press mentions; [] if none
 
-9. other (array of objects): any document sections not captured by the fields above:
+9. other (array of objects): any document sections not captured above:
    - sectionTitle: the name of the section as it appears in the document
    - content: the text content of that section
 
 CRITICAL RULES:
-- Return ONLY valid JSON. No markdown fences, no preamble, no explanation.
+- Return ONLY valid JSON. No markdown fences (no ```json), no preamble, no explanation.
 - Include EVERY top-level key from the schema; use null for absent scalars and [] for absent arrays.
 - Do NOT invent or infer data not explicitly present in the document.
-- Preserve exact spelling, capitalisation, and punctuation for all extracted values.
-- Output integer years (2020, not "2020") when a field shows only a year.
+- Preserve exact spelling, capitalisation, and punctuation for all extracted string values.
+- Output integer years (2020, not "2020") when a field contains only a year.
 - isCurrent must be a boolean (true or false), never a string.
             ```
 
@@ -145,44 +141,39 @@ FIELD-BY-FIELD EXTRACTION RULES:
 
 3. education (array of objects):
    - institution: exact institution name as written
-   - qualificationTitle: full degree or qualification title (e.g. "PhD in Computer Science",
-                         "Master of Business Administration")
-   - startDate: integer year or string, same rules as workExperience; null if not stated
+   - qualificationTitle: full degree or qualification title (e.g. "PhD in Computer Science")
+   - startDate: integer year or string; null if not stated
    - endDate: integer year or string; null if not yet completed or not stated
    - description: GPA, honours, thesis title, mentors, relevant coursework; null if none
 
 4. skills:
-   - If the document organises skills under category headings (e.g. "Technical Skills",
-     "Research Interests", "Marketing Platforms"): output an object where each key is a
+   - If skills are organised under category headings: output an object where each key is a
      category name and each value is an array of skill strings under that heading
    - If skills are listed without categories (flat list): output an array of skill strings
    - Output null if no skills section is present in the document
 
-5. socialLinks: array of all URLs found in the document (LinkedIn, GitHub, personal website,
-   ORCID, ResearchGate, etc.); output [] if none present
+5. socialLinks: array of all URLs found (LinkedIn, GitHub, ORCID, personal website, etc.); [] if none
 
 6. certificationsAndAwards (array of objects):
-   - description: the name or title of the certification, award, membership, or honor
-   - organization: the granting or issuing organisation
-   - date: the date awarded or obtained; null if not stated
+   - description: the name or title of the certification, award, or honour
+   - organization: the granting organisation
+   - date: the date awarded; null if not stated
    - category: one of "Certification", "Award", "Membership", "Honor", "License", or "Affiliation"
 
-7. publications: array of publication citation strings exactly as listed in the document;
-   output [] if no publications section is present
+7. publications: array of citation strings exactly as listed; [] if no publications section
 
-8. media: array of strings describing media appearances, press mentions, or interviews;
-   output [] if none present
+8. media: array of strings describing media appearances or press mentions; [] if none
 
-9. other (array of objects): any document sections not captured by the fields above:
+9. other (array of objects): any document sections not captured above:
    - sectionTitle: the name of the section as it appears in the document
    - content: the text content of that section
 
 CRITICAL RULES:
-- Return ONLY valid JSON. No markdown fences, no preamble, no explanation.
+- Return ONLY valid JSON. No markdown fences (no ```json), no preamble, no explanation.
 - Include EVERY top-level key from the schema; use null for absent scalars and [] for absent arrays.
 - Do NOT invent or infer data not explicitly present in the document.
-- Preserve exact spelling, capitalisation, and punctuation for all extracted values.
-- Output integer years (2020, not "2020") when a field shows only a year.
+- Preserve exact spelling, capitalisation, and punctuation for all extracted string values.
+- Output integer years (2020, not "2020") when a field contains only a year.
 - isCurrent must be a boolean (true or false), never a string.
             ```
 
@@ -196,14 +187,14 @@ CRITICAL RULES:
 
             ## 8. Limitations
 
-            - **Small dataset:** With only a few documents per schema, validation scores are noisy
-              and there is a risk of overfitting the prompt to the validation document(s).
-            - **Positional array alignment:** Object arrays are compared positionally; if the
-              predicted ordering differs from gold, items at each position are penalised even
-              when the content is correct.
-            - **Free-tier rate limits:** OpenRouter free models have a daily request cap (~50/day),
-              constraining how many iterations can run. A paid plan would allow full 20-iteration runs.
-            - **No train split used:** The greedy loop currently uses only the validation set for
-              feedback. Train documents are loaded but not yet used for few-shot example selection.
-            - **Stochastic judge caching:** `string_semantic` and `array_llm` scores are cached per
-              (pred, gold) pair, but the initial LLM judge call for novel pairs is non-deterministic.
+            - **Small dataset:** With only 2–8 documents per schema, validation scores are noisy
+              and there is real risk of overfitting the prompt to the 1–2 validation documents.
+            - **Positional array alignment:** Object arrays (workExperience, education) are compared
+              positionally. If predicted ordering differs from gold, items are penalised even when
+              content is correct.
+            - **Free-tier rate limits:** OpenRouter free models have a daily request cap (~50/day).
+              A paid-tier plan would allow full 20-iteration runs without interruption.
+            - **No train split used:** The greedy loop uses only the validation set for feedback.
+              Train documents are loaded but not yet exploited for few-shot example selection.
+            - **Stochastic metric caching:** `string_semantic` and `array_llm` scores are cached
+              per (pred, gold) pair within a run. Initial calls for novel pairs are non-deterministic.
